@@ -995,3 +995,7 @@ body {
     display: block;
   }
 }
+.tg-chat-status.typing {
+  color: #31b545 !important;
+  font-weight: 500;
+}

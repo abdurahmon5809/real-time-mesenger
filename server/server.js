@@ -7,18 +7,19 @@ const bcrypt = require('bcryptjs');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// ⭐️ Katta hajmdagi fayllarni qabul qilish uchun limitni oshirish (masalan, 50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  maxHttpBufferSize: 5e7,
+  maxHttpBufferSize: 5e7, // 50 MB socket limit
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
   }
 });
 
-// ⭐️ Local MongoDB ulanishi
 const DB_URI = 'mongodb://127.0.0.1:27017/telegram_web_pro';
 
 mongoose.connect(DB_URI)
@@ -29,7 +30,6 @@ mongoose.connect(DB_URI)
     console.error('❌ MongoDB ulanishida xatolik:', err);
   });
 
-// Schemalar va Modellar
 const userSchema = new mongoose.Schema({
   username: { type: String, unique: true, required: true },
   password: { type: String, required: true },
@@ -68,7 +68,6 @@ const Group = mongoose.model('Group', groupSchema);
 io.on('connection', (socket) => {
   console.log(`Foydalanuvchi ulandi: ${socket.id}`);
 
-  // Ro'yxatdan o'tish
   socket.on('register', async ({ username, password }, callback) => {
     try {
       const existing = await User.findOne({ username });
@@ -80,12 +79,10 @@ io.on('connection', (socket) => {
       await newUser.save();
       callback({ success: true, user: { username, avatar: '', bio: newUser.bio } });
     } catch (e) {
-      console.error('Register error:', e);
       callback({ success: false, message: 'Server xatosi yuz berdi!' });
     }
   });
 
-  // Tizimga kirish
   socket.on('login', async ({ username, password }, callback) => {
     try {
       const user = await User.findOne({ username });
@@ -96,12 +93,10 @@ io.on('connection', (socket) => {
 
       callback({ success: true, user: { username: user.username, avatar: user.avatar, bio: user.bio } });
     } catch (e) {
-      console.error('Login error:', e);
       callback({ success: false, message: 'Server xatosi!' });
     }
   });
 
-  // Foydalanuvchini ulanishi
   socket.on('join_user', async ({ username, avatar, bio }) => {
     await User.findOneAndUpdate(
       { username }, 
@@ -114,7 +109,6 @@ io.on('connection', (socket) => {
     io.emit('update_users_and_groups', { users, groups });
   });
 
-  // Profilni yangilash
   socket.on('update_profile', async ({ oldUsername, newUsername, bio, avatar }, callback) => {
     try {
       if (oldUsername !== newUsername) {
@@ -132,7 +126,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Akkauntni butunlay o'chirish
   socket.on('delete_account', async ({ username }, callback) => {
     try {
       await User.deleteOne({ username });
@@ -148,7 +141,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Guruh ochish
   socket.on('create_group', async ({ groupName, admin, members }, callback) => {
     try {
       const exists = await Group.findOne({ name: groupName });
@@ -165,23 +157,36 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Xonaga ulanish
   socket.on('join_room', async ({ sender, target, isGroup }) => {
     const roomName = isGroup ? target : [sender, target].sort().join('_');
+    
+    Array.from(socket.rooms).forEach(r => {
+      if (r !== socket.id) socket.leave(r);
+    });
+
     socket.join(roomName);
 
     if (!isGroup) {
-      await Message.updateMany({ room: roomName, receiver: sender, isRead: false }, { isRead: true });
+      await Message.updateMany(
+        { room: roomName, sender: target, receiver: sender, isRead: false }, 
+        { $set: { isRead: true } }
+      );
+      io.to(roomName).emit('messages_read', { reader: sender, room: roomName });
     }
 
     const history = await Message.find({ room: roomName });
-    socket.emit('load_history', history);
+    socket.emit('load_history', { room: roomName, history });
   });
 
-  // Xabar yuborish
   socket.on('send_message', async (data) => {
     const { sender, target, text, file, fileName, fileType, time, isGroup, replyTo } = data;
     const roomName = isGroup ? target : [sender, target].sort().join('_');
+
+    const roomClients = io.sockets.adapter.rooms.get(roomName);
+    let isTargetInRoom = false;
+    if (roomClients && roomClients.size > 1) {
+      isTargetInRoom = true;
+    }
 
     const newMessage = new Message({
       id: Date.now() + Math.random().toString(),
@@ -193,7 +198,7 @@ io.on('connection', (socket) => {
       fileName,
       fileType,
       time,
-      isRead: false,
+      isRead: isGroup ? false : isTargetInRoom,
       isEdited: false,
       replyTo: replyTo || null,
       reactions: {}
@@ -203,26 +208,26 @@ io.on('connection', (socket) => {
     io.to(roomName).emit('receive_message', newMessage);
   });
 
-  // Typing
   socket.on('typing', ({ room, username }) => {
-    socket.to(room).emit('display_typing', { username });
+    socket.to(room).emit('display_typing', { username, room });
   });
 
-  // Xabarni o'chirish
+  socket.on('stop_typing', ({ room, username }) => {
+    socket.to(room).emit('hide_typing', { username, room });
+  });
+
   socket.on('delete_message', async ({ msgId, room }) => {
     await Message.findOneAndDelete({ id: msgId });
     const history = await Message.find({ room });
-    io.to(room).emit('load_history', history);
+    io.to(room).emit('load_history', { room, history });
   });
 
-  // Xabarni tahrirlash
   socket.on('edit_message', async ({ msgId, newText, room }) => {
     await Message.findOneAndUpdate({ id: msgId }, { text: newText, isEdited: true });
     const history = await Message.find({ room });
-    io.to(room).emit('load_history', history);
+    io.to(room).emit('load_history', { room, history });
   });
 
-  // Reaksiyalar
   socket.on('toggle_reaction', async ({ msgId, emoji, username, room }) => {
     const msg = await Message.findOne({ id: msgId });
     if (msg) {
@@ -240,17 +245,15 @@ io.on('connection', (socket) => {
       }
       await msg.save();
       const history = await Message.find({ room });
-      io.to(room).emit('load_history', history);
+      io.to(room).emit('load_history', { room, history });
     }
   });
 
-  // Chat tarixini tozalash
   socket.on('clear_chat', async ({ room }) => {
     await Message.deleteMany({ room });
-    io.to(room).emit('load_history', []);
+    io.to(room).emit('load_history', { room, history: [] });
   });
 
-  // Guruhni o'chirish yoki tark etish
   socket.on('delete_or_leave_group', async ({ groupName, username }, callback) => {
     try {
       const group = await Group.findOne({ name: groupName });
@@ -272,12 +275,18 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Disconnect
   socket.on('disconnect', async () => {
-    await User.findOneAndUpdate({ socketId: socket.id }, { isOnline: false, socketId: null });
-    const users = await User.find({}, 'username avatar bio isOnline');
-    const groups = await Group.find({});
-    io.emit('update_users_and_groups', { users, groups });
+    const updatedUser = await User.findOneAndUpdate(
+      { socketId: socket.id }, 
+      { isOnline: false, socketId: null },
+      { new: true }
+    );
+    
+    if (updatedUser) {
+      const users = await User.find({}, 'username avatar bio isOnline');
+      const groups = await Group.find({});
+      io.emit('update_users_and_groups', { users, groups });
+    }
     console.log(`Foydalanuvchi chiqib ketdi: ${socket.id}`);
   });
 });

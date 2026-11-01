@@ -6,6 +6,10 @@ const socket = io.connect('http://localhost:3001');
 
 const emojiList = ['😀', '😂', '😍', '👍', '❤️', '🔥', '🎉', '😎', '🙏', '👏'];
 
+// ⭐️ Maksimal ruxsat etilgan fayl hajmi (Masalan: 10 MB)
+const MAX_FILE_SIZE_MB = 10;
+const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+
 const translations = {
   uz: {
     settings: 'Sozlamalar',
@@ -45,7 +49,8 @@ const translations = {
     clearChat: 'Chatni tozalash',
     deleteChat: 'Chatni o\'chirish',
     leaveGroup: 'Guruhdan chiqish',
-    deleteGroup: 'Guruhni o\'chirish'
+    deleteGroup: 'Guruhni o\'chirish',
+    fileTooLarge: `Kechirasiz, fayl hajmi ${MAX_FILE_SIZE_MB} MB dan katta bo'lishi mumkin emas!`
   },
   en: {
     settings: 'Settings',
@@ -85,7 +90,8 @@ const translations = {
     clearChat: 'Clear Chat',
     deleteChat: 'Delete Chat',
     leaveGroup: 'Leave Group',
-    deleteGroup: 'Delete Group'
+    deleteGroup: 'Delete Group',
+    fileTooLarge: `Sorry, file size cannot exceed ${MAX_FILE_SIZE_MB} MB!`
   }
 };
 
@@ -104,6 +110,7 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [message, setMessage] = useState('');
   const [typingStatus, setTypingStatus] = useState('');
+  const [typingUsers, setTypingUsers] = useState({});
 
   const [replyingToMsg, setReplyingToMsg] = useState(null);
   const [editingMsgId, setEditingMsgId] = useState(null);
@@ -134,7 +141,18 @@ function App() {
 
   const messagesEndRef = useRef(null);
   const typingTimeoutRef = useRef(null);
+  const clientTypingTimeoutRef = useRef(null);
   const t = translations[language] || translations.uz;
+
+  const activeChatRef = useRef(activeChat);
+  useEffect(() => {
+    activeChatRef.current = activeChat;
+  }, [activeChat]);
+
+  const usernameRef = useRef(username);
+  useEffect(() => {
+    usernameRef.current = username;
+  }, [username]);
 
   useEffect(() => {
     if ("Notification" in window && Notification.permission !== "granted") {
@@ -205,26 +223,79 @@ function App() {
       setAllGroups(groups);
     });
 
-    socket.on('load_history', (history) => {
-      setMessages(history);
+    socket.on('load_history', ({ room, history }) => {
+      const currentActive = activeChatRef.current;
+      const myName = usernameRef.current;
+      const expectedRoom = currentActive?.isGroup 
+        ? currentActive.name 
+        : (currentActive ? [myName, currentActive.name].sort().join('_') : null);
+
+      if (expectedRoom === room) {
+        setMessages(history);
+      }
     });
 
     socket.on('receive_message', (data) => {
+      const currentActive = activeChatRef.current;
+      const myName = usernameRef.current;
+      const expectedRoom = currentActive?.isGroup 
+        ? currentActive.name 
+        : (currentActive ? [myName, currentActive.name].sort().join('_') : null);
+
+      if (expectedRoom && expectedRoom === data.room) {
+        setMessages((list) => [...list, data]);
+      }
+
       setHiddenChats(prev => prev.filter(name => name !== data.sender && name !== data.target));
-      setMessages((list) => [...list, data]);
       setTypingStatus('');
 
-      if (notifications && data.sender !== username && "Notification" in window && Notification.permission === "granted") {
+      if (notifications && data.sender !== myName && "Notification" in window && Notification.permission === "granted") {
         new Notification(`${data.sender}`, { body: data.file ? '📎 Fayl yuborildi' : data.text });
       }
     });
 
-    socket.on('display_typing', ({ username: typingUser }) => {
-      setTypingStatus(`${typingUser} ${t.typing}`);
-      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-      typingTimeoutRef.current = setTimeout(() => {
+    socket.on('messages_read', ({ room }) => {
+      const currentActive = activeChatRef.current;
+      const myName = usernameRef.current;
+      const expectedRoom = currentActive?.isGroup 
+        ? currentActive.name 
+        : (currentActive ? [myName, currentActive.name].sort().join('_') : null);
+
+      if (expectedRoom === room) {
+        setMessages(list => list.map(m => ({ ...m, isRead: true })));
+      }
+    });
+
+    socket.on('display_typing', ({ username: typingUser, room }) => {
+      const currentActive = activeChatRef.current;
+      const myName = usernameRef.current;
+      const expectedRoom = currentActive?.isGroup 
+        ? currentActive.name 
+        : (currentActive ? [myName, currentActive.name].sort().join('_') : null);
+      
+      if (expectedRoom === room) {
+        setTypingStatus(`${typingUser} ${t.typing}`);
+      }
+      
+      setTypingUsers(prev => ({ ...prev, [typingUser]: true }));
+    });
+
+    socket.on('hide_typing', ({ username: typingUser, room }) => {
+      const currentActive = activeChatRef.current;
+      const myName = usernameRef.current;
+      const expectedRoom = currentActive?.isGroup 
+        ? currentActive.name 
+        : (currentActive ? [myName, currentActive.name].sort().join('_') : null);
+      
+      if (expectedRoom === room) {
         setTypingStatus('');
-      }, 2000);
+      }
+
+      setTypingUsers(prev => {
+        const updated = { ...prev };
+        delete updated[typingUser];
+        return updated;
+      });
     });
 
     socket.on('chat_deleted', () => {
@@ -237,10 +308,12 @@ function App() {
       socket.off('group_created');
       socket.off('load_history');
       socket.off('receive_message');
+      socket.off('messages_read');
       socket.off('display_typing');
+      socket.off('hide_typing');
       socket.off('chat_deleted');
     };
-  }, [isLoggedIn, username, avatar, bio, notifications, t.typing]);
+  }, [isLoggedIn, username, notifications, t.typing]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -301,6 +374,11 @@ function App() {
   };
 
   const handleSelectChat = (chatItem, isGroup = false) => {
+    if (activeChat) {
+      const oldRoom = activeChat.isGroup ? activeChat.name : [username, activeChat.name].sort().join('_');
+      socket.emit('stop_typing', { room: oldRoom, username });
+    }
+
     const chatName = chatItem.name || chatItem.username;
     setHiddenChats(prev => prev.filter(n => n !== chatName));
 
@@ -315,19 +393,32 @@ function App() {
   };
 
   const handleMessageChange = (e) => {
-    setMessage(e.target.value);
+    const val = e.target.value;
+    setMessage(val);
     if (activeChat) {
       const roomName = activeChat.isGroup ? activeChat.name : [username, activeChat.name].sort().join('_');
-      socket.emit('typing', { room: roomName, username });
+      if (val.trim().length > 0) {
+        socket.emit('typing', { room: roomName, username });
+
+        if (clientTypingTimeoutRef.current) clearTimeout(clientTypingTimeoutRef.current);
+        clientTypingTimeoutRef.current = setTimeout(() => {
+          socket.emit('stop_typing', { room: roomName, username });
+        }, 2000);
+      } else {
+        socket.emit('stop_typing', { room: roomName, username });
+      }
     }
   };
 
   const sendMessage = (e) => {
     e.preventDefault();
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    if (clientTypingTimeoutRef.current) clearTimeout(clientTypingTimeoutRef.current);
 
     if (message.trim() && activeChat) {
       const roomName = activeChat.isGroup ? activeChat.name : [username, activeChat.name].sort().join('_');
+      socket.emit('stop_typing', { room: roomName, username });
+
       if (editingMsgId) {
         socket.emit('edit_message', {
           msgId: editingMsgId,
@@ -438,9 +529,16 @@ function App() {
 
   const addEmoji = (emo) => setMessage(prev => prev + emo);
 
+  // ⭐️ Fayl hajmini tekshiruvchi funksiya
   const handleFileUpload = (e) => {
     const file = e.target.files[0];
     if (file && activeChat) {
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        alert(t.fileTooLarge);
+        e.target.value = ''; // Inputni tozalash
+        return;
+      }
+
       const reader = new FileReader();
       reader.onloadend = () => {
         const messageData = {
@@ -456,6 +554,7 @@ function App() {
         };
         socket.emit('send_message', messageData);
         setReplyingToMsg(null);
+        e.target.value = '';
       };
       reader.readAsDataURL(file);
     }
@@ -464,6 +563,12 @@ function App() {
   const handleAvatarUpload = (e) => {
     const file = e.target.files[0];
     if (file) {
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        alert(t.fileTooLarge);
+        e.target.value = '';
+        return;
+      }
+
       const reader = new FileReader();
       reader.onloadend = () => {
         setAvatar(reader.result);
@@ -489,15 +594,26 @@ function App() {
 
   const toggleTheme = () => setTheme(prev => prev === 'dark' ? 'light' : 'dark');
 
-  // ⭐️ O'zini ro'yxatdan chiqarib tashlash (user2 o'zini ko'rmasligi uchun)
   const filteredUsers = allUsers
     .filter(u => u.username !== username)
-    .filter(u => u.username.toLowerCase().includes(searchQuery.toLowerCase()))
-    .filter(u => !hiddenChats.includes(u.username));
+    .filter(u => {
+      const matchesSearch = u.username.toLowerCase().includes(searchQuery.toLowerCase());
+      const isHidden = hiddenChats.includes(u.username);
+      if (searchQuery.trim() !== '') {
+        return matchesSearch;
+      }
+      return matchesSearch && !isHidden;
+    });
 
   const filteredGroups = allGroups
-    .filter(g => g.name.toLowerCase().includes(searchQuery.toLowerCase()))
-    .filter(g => !hiddenChats.includes(g.name));
+    .filter(g => {
+      const matchesSearch = g.name.toLowerCase().includes(searchQuery.toLowerCase());
+      const isHidden = hiddenChats.includes(g.name);
+      if (searchQuery.trim() !== '') {
+        return matchesSearch;
+      }
+      return matchesSearch && !isHidden;
+    });
 
   if (!isLoggedIn) {
     return (
@@ -566,18 +682,23 @@ function App() {
             </div>
           ))}
 
-          {filteredUsers.map((user, index) => (
-            <div key={`u_${index}`} className={`tg-chat-item ${activeChat?.name === user.username ? 'active' : ''}`} onClick={() => handleSelectChat(user, false)}>
-              <div className="tg-avatar-container">
-                {user.avatar ? <img src={user.avatar} alt="Avatar" className="tg-avatar-img" /> : <div className="tg-avatar">{user.username[0].toUpperCase()}</div>}
-                {user.isOnline && <span className="tg-online-badge"></span>}
+          {filteredUsers.map((user, index) => {
+            const isTyping = typingUsers[user.username];
+            return (
+              <div key={`u_${index}`} className={`tg-chat-item ${activeChat?.name === user.username ? 'active' : ''}`} onClick={() => handleSelectChat(user, false)}>
+                <div className="tg-avatar-container">
+                  {user.avatar ? <img src={user.avatar} alt="Avatar" className="tg-avatar-img" /> : <div className="tg-avatar">{user.username[0].toUpperCase()}</div>}
+                  {user.isOnline && <span className="tg-online-badge"></span>}
+                </div>
+                <div className="tg-chat-info">
+                  <span className="tg-chat-name">{user.username}</span>
+                  <span className={`tg-chat-status ${isTyping ? 'typing' : (user.isOnline ? 'online' : 'offline')}`}>
+                    {isTyping ? t.typing : (user.isOnline ? t.online : t.offline)}
+                  </span>
+                </div>
               </div>
-              <div className="tg-chat-info">
-                <span className="tg-chat-name">{user.username}</span>
-                <span className={`tg-chat-status ${user.isOnline ? 'online' : 'offline'}`}>{user.isOnline ? t.online : t.offline}</span>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
