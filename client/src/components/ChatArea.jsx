@@ -1,298 +1,475 @@
-import React from "react";
-import { emojiList, SERVER_URL } from "../utils/constants";
+import React, { useState, useRef, useEffect } from "react";
+import { API_URL, EMOJIS } from "../utils/constants";
+import { getAvatarColor, getInitials, resolveAvatar } from "../utils/media";
 
-const resolveAvatar = (av) => {
-  if (!av) return "";
-  if (av.startsWith("http") || av.startsWith("data:") || av.startsWith("blob:")) return av;
-  return `${SERVER_URL}${av}`;
-};
+function ChatAvatar({ name, avatar, size = 40, isOnline = false }) {
+  const src = resolveAvatar(avatar);
+  const [imgError, setImgError] = useState(false);
+
+  useEffect(() => {
+    setImgError(false);
+  }, [src]);
+
+  return (
+    <div
+      className="avatar-wrapper"
+      style={{ width: size, height: size, minWidth: size }}
+    >
+      {src && !imgError ? (
+        <img
+          src={src}
+          alt={name || "Avatar"}
+          className="avatar-img"
+          style={{ width: size, height: size }}
+          onError={() => setImgError(true)}
+        />
+      ) : (
+        <div
+          className="avatar-placeholder"
+          style={{
+            width: size,
+            height: size,
+            backgroundColor: getAvatarColor(name),
+            fontSize: Math.max(11, Math.floor(size * 0.38)),
+          }}
+        >
+          {getInitials(name)}
+        </div>
+      )}
+      {isOnline && <span className="online-badge" />}
+    </div>
+  );
+}
 
 export default function ChatArea({
   activeChat,
-  closeActiveChat,
-  currentPartner,
-  typingStatus,
-  t,
-  handleClearChat,
-  handleLeaveOrDeleteGroup,
-  handleDeleteChat,
-  messagesContainerRef,
-  handleMessagesScroll,
+  currentUser,
+  currentUserId,
   messages,
-  userId,
-  username,
-  handleContextMenu,
-  privateFileUrls,
-  setActiveMedia,
-  openPrivateFile,
-  handleToggleReaction,
-  reactionPickerMsgId,
-  setReactionPickerMsgId,
-  messagesEndRef,
-  contextMenu,
-  handleStartReply,
-  handleStartEdit,
-  handleDeleteMessage,
-  replyingToMsg,
-  setReplyingToMsg,
-  editingMsgId,
-  setEditingMsgId,
-  setMessage,
-  sendMessage,
-  showEmojiPicker,
-  setShowEmojiPicker,
-  addEmoji,
-  handleFileUpload,
-  message,
-  handleMessageChange,
+  typingUsers,
+  users,
+  groups,
+  onSendMessage,
+  onEditMessage,
+  onDeleteMessage,
+  onToggleReaction,
+  onClearChat,
+  onDeleteOrLeaveGroup,
+  onOpenGroupInfo,
+  onTyping,
+  onStopTyping,
+  onLoadOlder,
+  hasMoreMessages,
+  isLoadingOlder,
+  onPreviewMedia,
+  onBackToList,
+  wallpaper,
+  chatError,
+  onClearChatError,
+  token,
+  t = (k) => k,
 }) {
+  const [text, setText] = useState("");
+  const [replyTo, setReplyTo] = useState(null);
+  const [editingMsg, setEditingMsg] = useState(null);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [activeReactionMsgId, setActiveReactionMsgId] = useState(null);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [uploadingFile, setUploadingFile] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+
+  const messagesEndRef = useRef(null);
+  const messagesListRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
+  const prevScrollHeightRef = useRef(0);
+  const isPrependingRef = useRef(false);
+
+  useEffect(() => {
+    if (isPrependingRef.current && messagesListRef.current) {
+      const newScrollHeight = messagesListRef.current.scrollHeight;
+      messagesListRef.current.scrollTop =
+        newScrollHeight - prevScrollHeightRef.current;
+      isPrependingRef.current = false;
+      return;
+    }
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages.length, activeChat?.name]);
+
+  useEffect(() => {
+    setReplyTo(null);
+    setEditingMsg(null);
+    setSelectedFile(null);
+    setUploadError("");
+    setShowEmojiPicker(false);
+    setActiveReactionMsgId(null);
+    setHeaderMenuOpen(false);
+    if (onClearChatError) onClearChatError();
+  }, [activeChat?.id, activeChat?.name]);
+
+  const handleMessagesScroll = () => {
+    const node = messagesListRef.current;
+    if (!node || !hasMoreMessages || isLoadingOlder || !onLoadOlder) return;
+    if (node.scrollTop <= 10) {
+      prevScrollHeightRef.current = node.scrollHeight;
+      isPrependingRef.current = true;
+      onLoadOlder();
+    }
+  };
+
   if (!activeChat) {
     return (
-      <div className="tg-chat-area">
-        <div className="tg-no-chat-selected">
-          <div className="tg-select-hint">{t.selectChatHint}</div>
+      <div className="chat-area empty-chat-area">
+        <div className="empty-chat-card">
+          <div className="empty-chat-icon">💬</div>
+          <h2>{t("selectChatTitle")}</h2>
+          <p>{t("selectChatDesc")}</p>
         </div>
       </div>
     );
   }
 
-  return (
-    <div className="tg-chat-area">
-      <div className="tg-chat-header">
-        <button className="tg-back-btn" onClick={closeActiveChat}>
-          ←
-        </button>
-        {activeChat.isGroup ? (
-          <div className="tg-avatar group-avatar">👥</div>
-        ) : currentPartner?.avatar ? (
+  const groupObj = activeChat.isGroup
+    ? groups.find((g) =>
+        typeof g === "object"
+          ? g.id === activeChat.id || g.name === activeChat.name
+          : g === activeChat.name,
+      )
+    : null;
+  const userObj = !activeChat.isGroup
+    ? users.find((u) =>
+        typeof u === "object"
+          ? u.id === activeChat.id || u.username === activeChat.name
+          : u === activeChat.name,
+      )
+    : null;
+
+  const isOnline = typeof userObj === "object" ? !!userObj?.isOnline : false;
+  const chatAvatar = activeChat.isGroup
+    ? typeof groupObj === "object"
+      ? groupObj?.avatar
+      : ""
+    : typeof userObj === "object"
+      ? userObj?.avatar
+      : "";
+
+  const isGroupAdmin =
+    activeChat.isGroup &&
+    typeof groupObj === "object" &&
+    ((currentUserId && groupObj?.adminId === currentUserId) ||
+      groupObj?.admin === currentUser);
+
+  const handleTextChange = (e) => {
+    const val = e.target.value;
+    setText(val);
+    if (uploadError) setUploadError("");
+    if (onClearChatError) onClearChatError();
+
+    if (onTyping) onTyping();
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      if (onStopTyping) onStopTyping();
+    }, 1800);
+  };
+
+  const handleFileSelect = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadError("");
+    if (file.size > 10 * 1024 * 1024) {
+      setUploadError(t("errFileTooBig"));
+      e.target.value = "";
+      return;
+    }
+    setSelectedFile(file);
+    e.target.value = "";
+  };
+
+  const uploadFileToServer = async (file) => {
+    const res = await fetch(`${API_URL}/api/files`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        "x-file-name": encodeURIComponent(file.name),
+        "x-file-type": file.type || "application/octet-stream",
+        "x-chat-target": activeChat.id || activeChat.name,
+        "x-chat-group": String(!!activeChat.isGroup),
+      },
+      body: file,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success || !data.file) {
+      throw new Error(data.message || t("errFileUpload"));
+    }
+    return data;
+  };
+
+  const handleSend = async (e) => {
+    e.preventDefault();
+    if (uploadingFile) return;
+
+    const trimmed = text.trim();
+    if (!trimmed && !selectedFile) {
+      setUploadError(t("errEmptyMessage"));
+      return;
+    }
+
+    if (onStopTyping) onStopTyping();
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+
+    if (editingMsg) {
+      if (!trimmed) {
+        setUploadError(t("errEmptyEdit"));
+        return;
+      }
+      onEditMessage(editingMsg.id, trimmed);
+      setEditingMsg(null);
+      setText("");
+      return;
+    }
+
+    let uploadedPayload = null;
+    if (selectedFile) {
+      setUploadingFile(true);
+      setUploadError("");
+      try {
+        uploadedPayload = await uploadFileToServer(selectedFile);
+      } catch (err) {
+        setUploadingFile(false);
+        setUploadError(err.message || t("errFileUpload"));
+        return;
+      }
+      setUploadingFile(false);
+    }
+
+    onSendMessage({
+      text: trimmed,
+      file: uploadedPayload ? uploadedPayload.file : null,
+      fileName: uploadedPayload ? uploadedPayload.fileName : null,
+      fileType: uploadedPayload ? uploadedPayload.fileType : null,
+      replyTo: replyTo
+        ? {
+            sender: replyTo.sender,
+            text: replyTo.text || replyTo.fileName || "Media",
+          }
+        : null,
+    });
+
+    setText("");
+    setReplyTo(null);
+    setSelectedFile(null);
+    setShowEmojiPicker(false);
+  };
+
+  const startEdit = (msg) => {
+    setEditingMsg(msg);
+    setReplyTo(null);
+    setText(msg.text || "");
+    setUploadError("");
+  };
+
+  const cancelEditOrReply = () => {
+    setEditingMsg(null);
+    setReplyTo(null);
+    setText("");
+    setUploadError("");
+  };
+
+  const renderFileAttachment = (msg) => {
+    if (!msg.file) return null;
+    const isImage =
+      (msg.fileType && msg.fileType.startsWith("image/")) ||
+      /\.(png|jpe?g|gif|webp)(\?|$)/i.test(msg.fileName || msg.file);
+
+    const downloadHref = msg.file.startsWith("http")
+      ? msg.file
+      : `${API_URL}${msg.file}`;
+
+    if (isImage) {
+      return (
+        <div className="msg-image-wrap">
           <img
-            src={resolveAvatar(currentPartner.avatar)}
-            alt="Avatar"
-            className="tg-avatar-img"
+            src={downloadHref}
+            alt={msg.fileName || "image"}
+            className="msg-image"
+            onClick={() =>
+              onPreviewMedia &&
+              onPreviewMedia(downloadHref, msg.fileName || "image.jpg")
+            }
           />
-        ) : (
-          <div className="tg-avatar">{activeChat.name[0].toUpperCase()}</div>
-        )}
-        <div className="tg-chat-header-info">
-          <h4>{activeChat.name}</h4>
-          <span className="tg-sub-status">
-            {typingStatus
-              ? typingStatus
-              : activeChat.isGroup
-              ? "Guruh"
-              : currentPartner?.isOnline
-              ? t.online
-              : t.offline}
-          </span>
         </div>
-        <div className="tg-chat-header-actions">
-          <button
-            title={t.clearChat}
-            onClick={handleClearChat}
-            className="tg-action-btn"
+      );
+    }
+
+    return (
+      <a
+        href={downloadHref}
+        target="_blank"
+        rel="noopener noreferrer"
+        download={msg.fileName || "file"}
+        className="msg-file-card"
+      >
+        <div className="msg-file-icon">📄</div>
+        <div className="msg-file-meta">
+          <span className="msg-file-name">
+            {msg.fileName || t("attachedFile")}
+          </span>
+          <span className="msg-file-sub">{t("downloadSub")}</span>
+        </div>
+      </a>
+    );
+  };
+
+  const typingList = (typingUsers || []).filter(
+    (u) => u !== currentUser && (!currentUserId || u !== currentUserId),
+  );
+  const memberCount =
+    typeof groupObj === "object" && groupObj?.members
+      ? groupObj.members.length
+      : 0;
+
+  return (
+    <div className={`chat-area wallpaper-${wallpaper || "doodle"}`}>
+      <div className="chat-header">
+        <div className="chat-header-left">
+          {onBackToList && (
+            <button
+              type="button"
+              className="icon-btn back-mobile-btn"
+              onClick={onBackToList}
+              title={t("backTitle")}
+            >
+              ←
+            </button>
+          )}
+          <div
+            className="chat-header-info clickable"
+            onClick={() =>
+              activeChat.isGroup &&
+              onOpenGroupInfo &&
+              onOpenGroupInfo(groupObj || activeChat)
+            }
           >
-            🧹
+            <ChatAvatar
+              name={activeChat.name}
+              avatar={chatAvatar}
+              size={40}
+              isOnline={!activeChat.isGroup && isOnline}
+            />
+            <div className="chat-header-text">
+              <div className="chat-header-title">
+                {activeChat.isGroup && <span className="group-tag">#</span>}
+                <span>{activeChat.name}</span>
+              </div>
+              <div className="chat-header-status">
+                {typingList.length > 0 ? (
+                  <span className="typing-status-text">
+                    {t("typingSingle", { users: typingList.join(", ") })}
+                  </span>
+                ) : activeChat.isGroup ? (
+                  <span>
+                    {memberCount > 0
+                      ? t("membersCount", { count: memberCount })
+                      : t("groupLabel")}
+                  </span>
+                ) : (
+                  <span className={isOnline ? "online-text" : ""}>
+                    {isOnline ? t("online") : t("offline")}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="chat-header-actions">
+          {activeChat.isGroup && (
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() =>
+                onOpenGroupInfo && onOpenGroupInfo(groupObj || activeChat)
+              }
+              title={t("groupInfoTitle")}
+            >
+              ℹ️
+            </button>
+          )}
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => setHeaderMenuOpen((prev) => !prev)}
+            title={t("chatActionsTitle")}
+          >
+            ⋮
           </button>
-          {activeChat.isGroup ? (
-            <button
-              title={t.deleteGroup}
-              onClick={handleLeaveOrDeleteGroup}
-              className="tg-action-btn danger"
-            >
-              🚪
-            </button>
-          ) : (
-            <button
-              title={t.deleteChat}
-              onClick={handleDeleteChat}
-              className="tg-action-btn danger"
-            >
-              🗑️
-            </button>
+
+          {headerMenuOpen && (
+            <>
+              <div
+                className="menu-backdrop"
+                onClick={() => setHeaderMenuOpen(false)}
+              />
+              <div className="dropdown-menu right-align">
+                {activeChat.isGroup && (
+                  <button
+                    type="button"
+                    className="dropdown-item"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      onOpenGroupInfo &&
+                        onOpenGroupInfo(groupObj || activeChat);
+                    }}
+                  >
+                    <span>👥</span> {t("groupMembers")}
+                  </button>
+                )}
+                {(!activeChat.isGroup || isGroupAdmin) && (
+                  <button
+                    type="button"
+                    className="dropdown-item danger"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      onClearChat && onClearChat();
+                    }}
+                  >
+                    <span>🧹</span> {t("clearHistory")}
+                  </button>
+                )}
+                {activeChat.isGroup && (
+                  <button
+                    type="button"
+                    className="dropdown-item danger"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      onDeleteOrLeaveGroup &&
+                        onDeleteOrLeaveGroup(
+                          activeChat.id || activeChat.name,
+                          isGroupAdmin,
+                        );
+                    }}
+                  >
+                    <span>{isGroupAdmin ? "🗑️" : "🚪"}</span>
+                    {isGroupAdmin ? t("deleteGroup") : t("leaveGroup")}
+                  </button>
+                )}
+              </div>
+            </>
           )}
         </div>
       </div>
 
-      <div
-        className="tg-messages-container"
-        ref={messagesContainerRef}
-        onScroll={handleMessagesScroll}
-      >
-        <div className="tg-messages-list">
-          {messages.map((msg, index) => {
-            const isOwn =
-              (msg.senderId && String(msg.senderId) === String(userId)) ||
-              (!msg.senderId && msg.sender === username);
-
-            return (
-              <div
-                key={msg.id || index}
-                className={`tg-message-bubble ${isOwn ? "out" : "in"}`}
-                onContextMenu={(e) => handleContextMenu(e, msg)}
-              >
-                {msg.replyTo && (
-                  <div className="tg-reply-preview-box">
-                    <span className="tg-reply-sender">{msg.replyTo.sender}</span>
-                    <span className="tg-reply-text">{msg.replyTo.text}</span>
-                  </div>
-                )}
-
-                {msg.file && (
-                  <div className="tg-file-container">
-                    {msg.fileType && msg.fileType.startsWith("image/") ? (
-                      <img
-                        src={
-                          privateFileUrls[msg.id] ||
-                          (msg.file.startsWith("data:") ? msg.file : "")
-                        }
-                        alt="Media"
-                        className="tg-message-image"
-                        onClick={() =>
-                          setActiveMedia(privateFileUrls[msg.id] || msg.file)
-                        }
-                      />
-                    ) : (
-                      <div className="tg-document-box">
-                        <span className="tg-doc-icon">📄</span>
-                        <div className="tg-doc-info">
-                          <span className="tg-doc-name">
-                            {msg.fileName || "Fayl"}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => openPrivateFile(msg.file, msg.fileName)}
-                            className="tg-doc-download"
-                          >
-                            {t.download} ⬇
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {activeChat.isGroup && !isOwn && (
-                  <div className="tg-group-msg-sender">{msg.sender}</div>
-                )}
-
-                {msg.text && <div className="tg-message-text">{msg.text}</div>}
-
-                {msg.reactions && Object.keys(msg.reactions).length > 0 && (
-                  <div className="tg-reactions-container">
-                    {Object.entries(msg.reactions).map(([emoji, reactors], idx) => {
-                      const reactedByMe =
-                        reactors.includes(String(userId)) ||
-                        reactors.includes(username);
-                      return (
-                        <span
-                          key={idx}
-                          className={`tg-reaction-badge ${
-                            reactedByMe ? "active" : ""
-                          }`}
-                          onClick={() => handleToggleReaction(msg.id, emoji)}
-                        >
-                          {emoji} {reactors.length}
-                        </span>
-                      );
-                    })}
-                  </div>
-                )}
-
-                <div className="tg-message-footer">
-                  {msg.isEdited && (
-                    <span className="tg-edited-label">{t.edited}</span>
-                  )}
-                  <span className="tg-message-time">{msg.time}</span>
-                  {isOwn && (
-                    <span
-                      className={`tg-read-receipt ${
-                        msg.isRead ? "read" : "unread"
-                      }`}
-                    >
-                      {msg.isRead ? "✓✓" : "✓"}
-                    </span>
-                  )}
-                  <button
-                    className="tg-reaction-trigger-btn"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setReactionPickerMsgId(
-                        reactionPickerMsgId === msg.id ? null : msg.id
-                      );
-                    }}
-                  >
-                    ➕
-                  </button>
-                </div>
-
-                {reactionPickerMsgId === msg.id && (
-                  <div
-                    className="tg-reaction-popover"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {emojiList.map((emo, eIdx) => (
-                      <span
-                        key={eIdx}
-                        onClick={() => handleToggleReaction(msg.id, emo)}
-                      >
-                        {emo}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-          <div ref={messagesEndRef} />
-        </div>
-      </div>
-
-      {contextMenu && (
-        <div
-          className="tg-context-menu"
-          style={{ top: contextMenu.y, left: contextMenu.x }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button onClick={() => handleStartReply(contextMenu.msg)}>
-            <span>↩️</span> {t.reply}
-          </button>
-          {((contextMenu.msg.senderId &&
-            String(contextMenu.msg.senderId) === String(userId)) ||
-            (!contextMenu.msg.senderId &&
-              contextMenu.msg.sender === username)) &&
-            contextMenu.msg.text && (
-              <button onClick={() => handleStartEdit(contextMenu.msg)}>
-                <span>✏️</span> {t.edit}
-              </button>
-            )}
+      {(chatError || uploadError) && (
+        <div className="chat-alert-banner" role="alert">
+          <span>{uploadError || chatError}</span>
           <button
-            onClick={() => handleDeleteMessage(contextMenu.msg.id)}
-            className="delete-action"
-          >
-            <span>🗑️</span> {t.delete}
-          </button>
-        </div>
-      )}
-
-      {replyingToMsg && (
-        <div className="tg-editing-bar">
-          <div>
-            <span style={{ fontWeight: "bold" }}>
-              ↩️ {replyingToMsg.sender}:{" "}
-            </span>
-            <span>{replyingToMsg.text || "Fayl"}</span>
-          </div>
-          <button onClick={() => setReplyingToMsg(null)}>✕</button>
-        </div>
-      )}
-
-      {editingMsgId && (
-        <div className="tg-editing-bar">
-          <span>✏️ Xabarni tahrirlash</span>
-          <button
+            type="button"
+            className="chat-alert-close"
             onClick={() => {
-              setEditingMsgId(null);
-              setMessage("");
+              setUploadError("");
+              if (onClearChatError) onClearChatError();
             }}
           >
             ✕
@@ -300,48 +477,295 @@ export default function ChatArea({
         </div>
       )}
 
-      <form onSubmit={sendMessage} className="tg-message-input-area">
-        <div className="tg-emoji-picker-container">
+      <div
+        className="messages-list"
+        ref={messagesListRef}
+        onScroll={handleMessagesScroll}
+      >
+        {isLoadingOlder && (
+          <div className="loading-older-hint">{t("loadingOlder")}</div>
+        )}
+        {hasMoreMessages && !isLoadingOlder && messages.length > 0 && (
+          <div className="load-more-hint">{t("scrollOlderHint")}</div>
+        )}
+
+        {messages.length === 0 ? (
+          <div className="no-messages-placeholder">{t("noMessagesYet")}</div>
+        ) : (
+          messages.map((msg, idx) => {
+            const isOwn =
+              (currentUserId &&
+                msg.senderId &&
+                String(msg.senderId) === String(currentUserId)) ||
+              msg.sender === currentUser;
+
+            const prevMsg = idx > 0 ? messages[idx - 1] : null;
+            const showSenderName =
+              activeChat.isGroup &&
+              !isOwn &&
+              (!prevMsg ||
+                prevMsg.sender !== msg.sender ||
+                prevMsg.senderId !== msg.senderId);
+
+            const reactionsObj =
+              msg.reactions instanceof Map
+                ? Object.fromEntries(msg.reactions)
+                : msg.reactions && typeof msg.reactions === "object"
+                  ? msg.reactions
+                  : {};
+
+            return (
+              <div
+                key={msg.id || msg._id || `${msg.sender}-${idx}`}
+                className={`message-row ${isOwn ? "own" : "other"}`}
+              >
+                {!isOwn && activeChat.isGroup && (
+                  <div className="msg-sender-avatar">
+                    <ChatAvatar name={msg.sender} avatar="" size={30} />
+                  </div>
+                )}
+
+                <div
+                  className={`message-bubble ${isOwn ? "own" : "other"} ${msg.pending ? "pending" : ""}`}
+                >
+                  {showSenderName && (
+                    <div className="msg-sender-label">{msg.sender}</div>
+                  )}
+
+                  {msg.replyTo && (
+                    <div className="msg-reply-quote">
+                      <div className="msg-reply-sender">
+                        {msg.replyTo.sender}
+                      </div>
+                      <div className="msg-reply-text">{msg.replyTo.text}</div>
+                    </div>
+                  )}
+
+                  {renderFileAttachment(msg)}
+
+                  {msg.text && <div className="msg-text">{msg.text}</div>}
+
+                  <div className="msg-meta">
+                    {msg.isEdited && (
+                      <span className="msg-edited">{t("editedTag")}</span>
+                    )}
+                    <span className="msg-time">{msg.time || ""}</span>
+                    {isOwn && (
+                      <span
+                        className={`msg-status ${msg.pending ? "pending" : msg.isRead ? "read" : "sent"}`}
+                      >
+                        {msg.pending ? "🕒" : msg.isRead ? "✓✓" : "✓"}
+                      </span>
+                    )}
+                  </div>
+
+                  {Object.keys(reactionsObj).length > 0 && (
+                    <div className="msg-reactions-list">
+                      {Object.entries(reactionsObj).map(
+                        ([emoji, usersList]) => {
+                          const list = Array.isArray(usersList)
+                            ? usersList
+                            : [];
+                          if (!list.length) return null;
+                          const reactedByMe =
+                            (currentUserId &&
+                              list.includes(String(currentUserId))) ||
+                            list.includes(currentUser);
+                          return (
+                            <button
+                              key={emoji}
+                              type="button"
+                              className={`reaction-chip ${reactedByMe ? "active" : ""}`}
+                              onClick={() =>
+                                onToggleReaction &&
+                                onToggleReaction(msg.id, emoji)
+                              }
+                            >
+                              <span>{emoji}</span>
+                              <span className="reaction-count">
+                                {list.length}
+                              </span>
+                            </button>
+                          );
+                        },
+                      )}
+                    </div>
+                  )}
+
+                  <div className="msg-hover-actions">
+                    <button
+                      type="button"
+                      title={t("reactionTitle")}
+                      onClick={() =>
+                        setActiveReactionMsgId((prev) =>
+                          prev === msg.id ? null : msg.id,
+                        )
+                      }
+                    >
+                      😊
+                    </button>
+                    <button
+                      type="button"
+                      title={t("replyTitle")}
+                      onClick={() => {
+                        setEditingMsg(null);
+                        setReplyTo(msg);
+                      }}
+                    >
+                      ↩️
+                    </button>
+                    {isOwn && !msg.pending && msg.text && (
+                      <button
+                        type="button"
+                        title={t("editTitle")}
+                        onClick={() => startEdit(msg)}
+                      >
+                        ✏️
+                      </button>
+                    )}
+                    {(isOwn || isGroupAdmin) && !msg.pending && (
+                      <button
+                        type="button"
+                        title={t("deleteTitle")}
+                        onClick={() =>
+                          onDeleteMessage && onDeleteMessage(msg.id)
+                        }
+                      >
+                        🗑️
+                      </button>
+                    )}
+                  </div>
+
+                  {activeReactionMsgId === msg.id && (
+                    <div className="reaction-popover">
+                      {EMOJIS.map((em) => (
+                        <button
+                          key={em}
+                          type="button"
+                          onClick={() => {
+                            onToggleReaction && onToggleReaction(msg.id, em);
+                            setActiveReactionMsgId(null);
+                          }}
+                        >
+                          {em}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {(replyTo || editingMsg || selectedFile) && (
+        <div className="composer-banner">
+          <div className="composer-banner-content">
+            {editingMsg && (
+              <>
+                <span className="banner-tag">{t("editingBanner")}</span>
+                <span className="banner-preview">{editingMsg.text}</span>
+              </>
+            )}
+            {replyTo && !editingMsg && (
+              <>
+                <span className="banner-tag">
+                  {t("replyBanner", { sender: replyTo.sender })}
+                </span>
+                <span className="banner-preview">
+                  {replyTo.text || replyTo.fileName || "Media"}
+                </span>
+              </>
+            )}
+            {selectedFile && (
+              <>
+                <span className="banner-tag">{t("fileBanner")}</span>
+                <span className="banner-preview">
+                  {selectedFile.name} ({Math.ceil(selectedFile.size / 1024)} KB)
+                </span>
+              </>
+            )}
+          </div>
           <button
             type="button"
-            className="tg-emoji-btn"
-            onClick={() => setShowEmojiPicker(!showEmojiPicker)}
+            className="banner-close-btn"
+            onClick={() => {
+              if (selectedFile) setSelectedFile(null);
+              else cancelEditOrReply();
+            }}
           >
-            😊
+            ✕
           </button>
+        </div>
+      )}
+
+      <form className="message-composer" onSubmit={handleSend}>
+        <input
+          type="file"
+          ref={fileInputRef}
+          style={{ display: "none" }}
+          onChange={handleFileSelect}
+        />
+        <button
+          type="button"
+          className="icon-btn composer-attach-btn"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={uploadingFile || !!editingMsg}
+          title={t("attachFileTitle")}
+        >
+          📎
+        </button>
+
+        <div className="composer-input-wrap">
+          <input
+            type="text"
+            placeholder={
+              uploadingFile
+                ? t("uploadingFile")
+                : editingMsg
+                  ? t("editMessagePlaceholder")
+                  : t("typeMessagePlaceholder")
+            }
+            value={text}
+            onChange={handleTextChange}
+            disabled={uploadingFile}
+          />
+          <button
+            type="button"
+            className="icon-btn emoji-toggle-btn"
+            onClick={() => setShowEmojiPicker((prev) => !prev)}
+            title="Emoji"
+          >
+            😀
+          </button>
+
           {showEmojiPicker && (
-            <div className="tg-emoji-popover">
-              {emojiList.map((emo, idx) => (
-                <span key={idx} onClick={() => addEmoji(emo)}>
-                  {emo}
-                </span>
+            <div className="emoji-picker-popover">
+              {EMOJIS.map((em) => (
+                <button
+                  key={em}
+                  type="button"
+                  onClick={() => {
+                    setText((prev) => `${prev}${em}`);
+                    setShowEmojiPicker(false);
+                  }}
+                >
+                  {em}
+                </button>
               ))}
             </div>
           )}
         </div>
-        <label
-          htmlFor="file-input"
-          className="tg-attach-btn"
-          title="Fayl biriktirish"
+
+        <button
+          type="submit"
+          className="send-msg-btn"
+          disabled={uploadingFile}
+          title={editingMsg ? t("saveTitle") : t("sendTitle")}
         >
-          📎
-        </label>
-        <input
-          id="file-input"
-          type="file"
-          onChange={handleFileUpload}
-          style={{ display: "none" }}
-        />
-        <input
-          type="text"
-          placeholder={t.typeMessage}
-          value={message}
-          onChange={handleMessageChange}
-        />
-        <button type="submit" className="tg-send-btn">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
-            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
-          </svg>
+          {uploadingFile ? "⏳" : editingMsg ? "✓" : "➤"}
         </button>
       </form>
     </div>

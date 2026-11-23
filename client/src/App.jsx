@@ -1,1158 +1,861 @@
-import React, { useState, useEffect, useRef } from "react";
-import "./App.css";
-import {
-  SERVER_URL,
-  MAX_FILE_SIZE_BYTES,
-  translations,
-} from "./utils/constants";
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+} from "react";
 import { socket } from "./utils/socket";
+import { DEFAULT_BIO } from "./utils/constants";
+import { createTranslator } from "./utils/i18n";
+import { useChatSocket } from "./hooks/useChatSocket";
 import AuthScreen from "./components/AuthScreen";
 import Sidebar from "./components/Sidebar";
 import ChatArea from "./components/ChatArea";
-import Modals from "./components/Modals";
+import {
+  CreateGroupModal,
+  ProfileModal,
+  GroupInfoModal,
+  SettingsModal,
+  MediaViewerModal,
+} from "./components/Modals";
+import "./App.css";
 
-function App() {
-  const [username, setUsername] = useState(
-    () => localStorage.getItem("chat_username") || ""
-  );
-  const [password, setPassword] = useState("");
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [userId, setUserId] = useState("");
-  const [isRegistering, setIsRegistering] = useState(false);
+const createClientMsgId = () => {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
+    return crypto.randomUUID();
+  }
+  return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+};
+
+export default function App() {
+  const [currentUser, setCurrentUser] = useState("");
+  const [currentUserId, setCurrentUserId] = useState("");
+  const [authToken, setAuthToken] = useState("");
+  const [myAvatar, setMyAvatar] = useState("");
+  const [myBio, setMyBio] = useState(DEFAULT_BIO);
   const [authError, setAuthError] = useState("");
-  const [allUsers, setAllUsers] = useState([]);
-  const [allGroups, setAllGroups] = useState([]);
-  const [searchQuery, setSearchQuery] = useState("");
+
+  const [users, setUsers] = useState([]);
+  const [groups, setGroups] = useState([]);
+  const [summaries, setSummaries] = useState({});
   const [activeChat, setActiveChat] = useState(null);
+  const [currentRoomId, setCurrentRoomId] = useState("");
   const [messages, setMessages] = useState([]);
-  const [message, setMessage] = useState("");
-  const [typingStatus, setTypingStatus] = useState("");
-  const [typingUsers, setTypingUsers] = useState({});
-  const [replyingToMsg, setReplyingToMsg] = useState(null);
-  const [editingMsgId, setEditingMsgId] = useState(null);
-  const [contextMenu, setContextMenu] = useState(null);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [isProfileOpen, setIsProfileOpen] = useState(false);
-  const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false);
-  const [newGroupName, setNewGroupName] = useState("");
-  const [selectedGroupMembers, setSelectedGroupMembers] = useState([]);
-  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
-  const [reactionPickerMsgId, setReactionPickerMsgId] = useState(null);
-  const [privateFileUrls, setPrivateFileUrls] = useState({});
-  const [chatSummaries, setChatSummaries] = useState({});
+  const [typingByRoom, setTypingByRoom] = useState({});
+  const [isConnected, setIsConnected] = useState(socket.connected);
+
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  const [chatError, setChatError] = useState("");
+
+  const [showCreateGroup, setShowCreateGroup] = useState(false);
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [groupInfoTarget, setGroupInfoTarget] = useState(null);
+  const [mediaViewer, setMediaViewer] = useState(null);
 
   const [theme, setTheme] = useState(
-    () => localStorage.getItem("chat_theme") || "dark"
-  );
-  const [language, setLanguage] = useState(
-    () => localStorage.getItem("chat_lang") || "uz"
-  );
-  const [notifications, setNotifications] = useState(
-    () => localStorage.getItem("chat_notif") !== "false"
+    () => localStorage.getItem("chat_theme") || "light",
   );
   const [wallpaper, setWallpaper] = useState(
-    () => localStorage.getItem("chat_wp") || "doodle"
+    () => localStorage.getItem("chat_wallpaper") || "doodle",
   );
-  const [hiddenChats, setHiddenChats] = useState(() => {
-    const saved = localStorage.getItem("chat_hidden");
-    return saved ? JSON.parse(saved) : [];
-  });
-
-  const [newUsername, setNewUsername] = useState(username);
-  const [bio, setBio] = useState(
-    () =>
-      localStorage.getItem("chat_bio") ||
-      "Hey there! I am using Telegram Web Pro."
+  const [language, setLanguage] = useState(
+    () => localStorage.getItem("chat_lang") || "uz",
   );
-  // Rule 12: Do not store Base64 avatars in localStorage; keep URL or in-memory state
-  const [avatar, setAvatar] = useState("");
-  const [activeMedia, setActiveMedia] = useState(null);
+  const [soundEnabled, setSoundEnabled] = useState(
+    () => localStorage.getItem("chat_sound") !== "false",
+  );
 
-  const messagesEndRef = useRef(null);
-  const messagesContainerRef = useRef(null);
-  const typingTimeoutRef = useRef(null);
-  const clientTypingTimeoutRef = useRef(null);
+  const t = useMemo(() => createTranslator(language), [language]);
+
   const activeChatRef = useRef(activeChat);
-  const usernameRef = useRef(username);
-  const userIdRef = useRef(userId);
-  const draftsRef = useRef({});
-  const pendingIdsRef = useRef({});
-  const seenMessageIdsRef = useRef(new Set());
-  const hasMoreHistoryRef = useRef(true);
-  const loadingOlderRef = useRef(false);
-
-  const t = translations[language] || translations.uz;
+  const currentRoomIdRef = useRef(currentRoomId);
+  const currentUserRef = useRef(currentUser);
+  const currentUserIdRef = useRef(currentUserId);
+  const tRef = useRef(t);
 
   useEffect(() => {
     activeChatRef.current = activeChat;
   }, [activeChat]);
 
   useEffect(() => {
-    usernameRef.current = username;
-  }, [username]);
+    currentRoomIdRef.current = currentRoomId;
+  }, [currentRoomId]);
 
   useEffect(() => {
-    userIdRef.current = userId;
-  }, [userId]);
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
 
   useEffect(() => {
-    // Clean up any legacy base64 avatar stored in localStorage (Rule 12)
-    if (localStorage.getItem("chat_avatar")) {
-      localStorage.removeItem("chat_avatar");
-    }
-    if ("Notification" in window && Notification.permission !== "granted") {
-      Notification.requestPermission();
-    }
-  }, []);
+    currentUserIdRef.current = currentUserId;
+  }, [currentUserId]);
 
   useEffect(() => {
-    const handleBeforeUnload = () => {
-      socket.disconnect();
-    };
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    return () => {
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-    };
-  }, []);
+    tRef.current = t;
+  }, [t]);
 
   useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.key === "Escape") {
-        setContextMenu(null);
-        setShowEmojiPicker(false);
-        setReactionPickerMsgId(null);
-        if (activeMedia) setActiveMedia(null);
-        else if (isProfileOpen) setIsProfileOpen(false);
-        else if (isSettingsOpen) setIsSettingsOpen(false);
-        else if (isCreateGroupOpen) setIsCreateGroupOpen(false);
-        else if (editingMsgId) {
-          setEditingMsgId(null);
-          setMessage("");
-        } else if (replyingToMsg) setReplyingToMsg(null);
-        else if (activeChat) closeActiveChat();
-      }
-    };
-    const handleClickOutside = () => {
-      setContextMenu(null);
-      setReactionPickerMsgId(null);
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("click", handleClickOutside);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("click", handleClickOutside);
-    };
-  }, [
-    activeMedia,
-    isProfileOpen,
-    isSettingsOpen,
-    isCreateGroupOpen,
-    editingMsgId,
-    replyingToMsg,
-    activeChat,
-  ]);
-
-  useEffect(() => {
+    document.body.classList.toggle("dark", theme === "dark");
     localStorage.setItem("chat_theme", theme);
-    localStorage.setItem("chat_lang", language);
-    localStorage.setItem("chat_bio", bio);
-    localStorage.setItem("chat_notif", notifications);
-    localStorage.setItem("chat_wp", wallpaper);
-    localStorage.setItem("chat_hidden", JSON.stringify(hiddenChats));
-  }, [theme, language, bio, notifications, wallpaper, hiddenChats]);
-
-  const resetToLogin = () => {
-    localStorage.removeItem("chat_token");
-    localStorage.removeItem("chat_username");
-    socket.auth = { token: "" };
-    setIsLoggedIn(false);
-    setUserId("");
-    setUsername("");
-    setPassword("");
-    setAvatar("");
-    setActiveChat(null);
-    activeChatRef.current = null;
-    setMessages([]);
-    setChatSummaries({});
-    draftsRef.current = {};
-    pendingIdsRef.current = {};
-  };
+  }, [theme]);
 
   useEffect(() => {
-    const onSessionRestored = ({ user }) => {
-      if (!user) return;
-      setUsername(user.username);
-      setUserId(user.id || user.userId || "");
-      setNewUsername(user.username);
-      setAvatar(user.avatar || "");
-      setBio(user.bio || "");
-      setIsLoggedIn(true);
-      localStorage.setItem("chat_username", user.username);
-    };
+    localStorage.setItem("chat_wallpaper", wallpaper);
+  }, [wallpaper]);
 
-    // Rule 4: Force logout & return to login screen when session expires/invalidated
-    const onSessionExpired = () => {
-      resetToLogin();
-      socket.disconnect();
-      socket.connect();
-    };
+  useEffect(() => {
+    localStorage.setItem("chat_lang", language);
+  }, [language]);
 
-    const onDirectory = ({ users, groups, summaries }) => {
-      setAllUsers(users || []);
-      setAllGroups(groups || []);
-      if (summaries) {
-        setChatSummaries((prev) => ({ ...prev, ...summaries }));
-      }
-    };
+  useEffect(() => {
+    localStorage.setItem("chat_sound", String(soundEnabled));
+  }, [soundEnabled]);
 
-    const onGroups = (groups) => setAllGroups(groups || []);
+  const computeRoomIdForChat = useCallback((chat, myId) => {
+    if (!chat) return "";
+    if (chat.isGroup && chat.id) return `group:${chat.id}`;
+    if (!chat.isGroup && myId && chat.id) {
+      return `dm:${[String(myId), String(chat.id)].sort().join(":")}`;
+    }
+    return "";
+  }, []);
 
-    const onRoomJoined = ({ room, target, targetId }) => {
-      const current = activeChatRef.current;
-      if (
-        current &&
-        ((targetId && String(current.id) === String(targetId)) ||
-          !target ||
-          current.name === target)
-      ) {
-        const next = { ...current, roomId: room };
-        activeChatRef.current = next;
-        setActiveChat(next);
-      }
-    };
+  const clearSessionState = useCallback((notice = "") => {
+    setCurrentUser("");
+    setCurrentUserId("");
+    setAuthToken("");
+    setMyAvatar("");
+    setMyBio(DEFAULT_BIO);
+    setUsers([]);
+    setGroups([]);
+    setSummaries({});
+    setActiveChat(null);
+    setCurrentRoomId("");
+    setMessages([]);
+    setTypingByRoom({});
+    setHasMoreMessages(false);
+    setIsLoadingOlder(false);
+    setChatError("");
+    setShowCreateGroup(false);
+    setShowProfileModal(false);
+    setShowSettingsModal(false);
+    setGroupInfoTarget(null);
+    if (notice) setAuthError(notice);
+  }, []);
 
-    // Rule 7: Ignore delayed history belonging to a previously opened chat
-    const onHistory = ({ room, history }) => {
-      if (!activeChatRef.current || activeChatRef.current.roomId !== room) {
-        return;
-      }
-      hasMoreHistoryRef.current = (history || []).length === 50;
-      setChatSummaries((prev) => ({
-        ...prev,
-        [room]: { ...(prev[room] || {}), unreadCount: 0 },
-      }));
-      setMessages(history || []);
-      const meId = String(userIdRef.current);
-      const lastIncoming = [...(history || [])]
-        .reverse()
-        .find((m) => String(m.receiverId) === meId && !m.isRead);
-      if (lastIncoming) {
-        socket.emit("mark_read", { room, upToMessageId: lastIncoming.id });
-      }
-    };
+  useEffect(() => {
+    const savedToken =
+      sessionStorage.getItem("chat_token") ||
+      localStorage.getItem("chat_token") ||
+      "";
+    const savedUsername =
+      sessionStorage.getItem("chat_user") ||
+      localStorage.getItem("chat_user") ||
+      "";
+    const savedUserId =
+      sessionStorage.getItem("chat_user_id") ||
+      localStorage.getItem("chat_user_id") ||
+      "";
 
-    const onReceiveMessage = (data) => {
-      if (!data) return;
-      const isDuplicate = data.id && seenMessageIdsRef.current.has(data.id);
-      if (data.id) {
-        seenMessageIdsRef.current.add(data.id);
-        if (seenMessageIdsRef.current.size > 5000) {
-          seenMessageIdsRef.current.clear();
+    if (savedToken) {
+      setAuthToken(savedToken);
+      if (savedUsername) setCurrentUser(savedUsername);
+      if (savedUserId) setCurrentUserId(savedUserId);
+      socket.auth = { token: savedToken };
+      if (!socket.connected) socket.connect();
+    }
+  }, []);
+
+  const { bumpRoomGeneration, requestOlderMessages } = useChatSocket({
+    authToken,
+    activeChat,
+    currentUserId,
+    soundEnabled,
+    onConnectedChange: setIsConnected,
+    onSessionRestored: (userObj) => {
+      if (!userObj) return;
+      setCurrentUser(userObj.username || "");
+      setCurrentUserId(userObj.id || userObj.userId || "");
+      setMyAvatar(userObj.avatar || "");
+      setMyBio(userObj.bio || DEFAULT_BIO);
+      setAuthError("");
+      if (userObj.username)
+        sessionStorage.setItem("chat_user", userObj.username);
+      if (userObj.id || userObj.userId)
+        sessionStorage.setItem("chat_user_id", userObj.id || userObj.userId);
+    },
+    onSessionExpired: (msg) => {
+      sessionStorage.removeItem("chat_token");
+      sessionStorage.removeItem("chat_user");
+      sessionStorage.removeItem("chat_user_id");
+      localStorage.removeItem("chat_token");
+      localStorage.removeItem("chat_user");
+      localStorage.removeItem("chat_user_id");
+      clearSessionState(msg);
+    },
+    onDirectoryUpdate: (payload) => {
+      if (!payload) return;
+      if (Array.isArray(payload.users)) {
+        setUsers(payload.users);
+        const me = payload.users.find(
+          (u) =>
+            (currentUserIdRef.current &&
+              (u.id === currentUserIdRef.current ||
+                u.userId === currentUserIdRef.current)) ||
+            u.username === currentUserRef.current,
+        );
+        if (me) {
+          if (me.username) setCurrentUser(me.username);
+          if (me.avatar !== undefined) setMyAvatar(me.avatar || "");
+          if (me.bio !== undefined) setMyBio(me.bio || DEFAULT_BIO);
         }
       }
-      const meId = String(userIdRef.current);
-      const isActiveRoom = activeChatRef.current?.roomId === data.room;
-
-      // Update sidebar last message, time & unread count (Rule 11)
-      setChatSummaries((prev) => {
-        const currentSummary = prev[data.room] || { unreadCount: 0 };
-        const increment =
-          !isDuplicate && !isActiveRoom && String(data.senderId) !== meId
-            ? 1
-            : 0;
-        return {
-          ...prev,
-          [data.room]: {
-            lastMessage: data,
-            unreadCount: isActiveRoom
-              ? 0
-              : (currentSummary.unreadCount || 0) + increment,
-          },
-        };
-      });
-
-      if (isDuplicate) return;
-
-      if (isActiveRoom) {
-        setMessages((list) =>
-          list.some((item) => item.id === data.id) ? list : [...list, data]
-        );
-        if (String(data.receiverId) === meId && !data.isRead) {
-          socket.emit("mark_read", { room: data.room, upToMessageId: data.id });
-        }
+      if (Array.isArray(payload.groups)) {
+        setGroups(payload.groups);
       }
-
-      setHiddenChats((prev) =>
-        prev.filter((name) => name !== data.sender && name !== data.receiver)
-      );
-      setTypingStatus("");
-
-      if (
-        notifications &&
-        String(data.senderId) !== meId &&
-        data.sender !== usernameRef.current &&
-        "Notification" in window &&
-        Notification.permission === "granted"
-      ) {
-        new Notification(String(data.sender || "Yangi xabar"), {
-          body: data.file ? "📎 Fayl yuborildi" : data.text,
-        });
+      if (payload.summaries && typeof payload.summaries === "object") {
+        setSummaries(payload.summaries);
       }
-    };
-
-    const onMessageUpdated = ({ room, message: updatedMsg }) => {
-      if (activeChatRef.current?.roomId === room) {
-        setMessages((list) =>
-          list.map((item) => (item.id === updatedMsg.id ? updatedMsg : item))
-        );
-      }
-      setChatSummaries((prev) => {
-        if (prev[room]?.lastMessage?.id === updatedMsg.id) {
+    },
+    onRoomJoined: (payload) => {
+      if (!payload?.room) return;
+      setCurrentRoomId(payload.room);
+      setActiveChat((prev) => {
+        if (!prev) return prev;
+        if (
+          payload.isGroup &&
+          prev.isGroup &&
+          (prev.name === payload.target || prev.id === payload.targetId)
+        ) {
           return {
             ...prev,
-            [room]: { ...prev[room], lastMessage: updatedMsg },
+            id: payload.targetId || prev.id,
+            name: payload.target || prev.name,
+          };
+        }
+        if (
+          !payload.isGroup &&
+          !prev.isGroup &&
+          (prev.name === payload.target || prev.id === payload.targetId)
+        ) {
+          return {
+            ...prev,
+            id: payload.targetId || prev.id,
+            name: payload.target || prev.name,
           };
         }
         return prev;
       });
-    };
-
-    const onMessageDeleted = ({ room, msgId }) => {
-      if (activeChatRef.current?.roomId === room) {
-        setMessages((list) => list.filter((item) => item.id !== msgId));
-      }
-    };
-
-    const onMessagesRead = ({ room, readerId, upToMessageId }) => {
-      const meId = String(userIdRef.current);
-      if (activeChatRef.current?.roomId === room) {
-        setMessages((list) => {
-          const boundaryMsg = upToMessageId
-            ? list.find((x) => x.id === upToMessageId)
-            : null;
-          return list.map((m) => {
-            if (
-              String(m.senderId) === meId &&
-              String(readerId) !== meId &&
-              (!boundaryMsg ||
-                m.createdAt < boundaryMsg.createdAt ||
-                (m.createdAt === boundaryMsg.createdAt &&
-                  String(m._id || m.id) <=
-                    String(boundaryMsg._id || boundaryMsg.id)))
-            ) {
-              return { ...m, isRead: true };
-            }
-            return m;
-          });
-        });
-      }
-    };
-
-    const onTyping = ({ username: typingUser, userId: typingUserId, room }) => {
-      if (activeChatRef.current?.roomId === room) {
-        setTypingStatus(`${typingUser} ${t.typing}`);
-      }
-      setTypingUsers((prev) => ({
-        ...prev,
-        [typingUserId || typingUser]: true,
-        [typingUser]: true,
-      }));
-    };
-
-    const onStopTyping = ({
-      username: typingUser,
-      userId: typingUserId,
-      room,
-    }) => {
-      if (activeChatRef.current?.roomId === room) setTypingStatus("");
-      setTypingUsers((prev) => {
-        const updated = { ...prev };
-        if (typingUserId) delete updated[typingUserId];
-        delete updated[typingUser];
-        return updated;
-      });
-    };
-
-    // Rule 14: Close group window across all tabs if removed/left/deleted
-    const onChatDeleted = ({ room } = {}) => {
-      if (!room || activeChatRef.current?.roomId === room) {
-        setMessages([]);
-        setActiveChat(null);
-        activeChatRef.current = null;
-      }
-      if (room) {
-        setChatSummaries((prev) => {
-          const copy = { ...prev };
-          delete copy[room];
-          return copy;
-        });
-      }
-    };
-
-    const onConnectError = (error) => {
+    },
+    onLoadHistory: (payload) => {
+      const activeRoom =
+        currentRoomIdRef.current ||
+        computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
       if (
-        error?.message === "SESSION_INVALID" &&
-        localStorage.getItem("chat_token")
-      ) {
-        onSessionExpired();
-      }
-    };
-
-    // Rule 1: Automatically restore open chat upon socket reconnect
-    const onSocketConnect = () => {
-      const current = activeChatRef.current;
-      if (!current) return;
-      socket.emit(
-        "join_room",
-        {
-          target: current.isGroup ? current.id : current.id || current.name,
-          isGroup: !!current.isGroup,
-        },
-        (res) => {
-          if (res?.success) {
-            const next = { ...current, roomId: res.room };
-            activeChatRef.current = next;
-            setActiveChat(next);
-          } else if (res?.code === "SESSION_INVALID") {
-            onSessionExpired();
-          }
-        }
-      );
-    };
-
-    socket.on("connect", onSocketConnect);
-    socket.on("connect_error", onConnectError);
-    socket.on("session_restored", onSessionRestored);
-    socket.on("session_expired", onSessionExpired);
-    socket.on("update_users_and_groups", onDirectory);
-    socket.on("group_created", onGroups);
-    socket.on("room_joined", onRoomJoined);
-    socket.on("load_history", onHistory);
-    socket.on("receive_message", onReceiveMessage);
-    socket.on("messages_read", onMessagesRead);
-    socket.on("message_updated", onMessageUpdated);
-    socket.on("message_deleted", onMessageDeleted);
-    socket.on("display_typing", onTyping);
-    socket.on("hide_typing", onStopTyping);
-    socket.on("chat_deleted", onChatDeleted);
-    socket.connect();
-
-    return () => {
-      socket.off("connect", onSocketConnect);
-      socket.off("connect_error", onConnectError);
-      socket.off("session_restored", onSessionRestored);
-      socket.off("session_expired", onSessionExpired);
-      socket.off("update_users_and_groups", onDirectory);
-      socket.off("group_created", onGroups);
-      socket.off("room_joined", onRoomJoined);
-      socket.off("load_history", onHistory);
-      socket.off("receive_message", onReceiveMessage);
-      socket.off("messages_read", onMessagesRead);
-      socket.off("message_updated", onMessageUpdated);
-      socket.off("message_deleted", onMessageDeleted);
-      socket.off("display_typing", onTyping);
-      socket.off("hide_typing", onStopTyping);
-      socket.off("chat_deleted", onChatDeleted);
-    };
-  }, [notifications, t.typing]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  // Rule 8: Cursor pagination using both createdAt and message ID so no messages are skipped or duplicated
-  const handleMessagesScroll = (e) => {
-    const node = e.target;
-    if (
-      node.scrollTop === 0 &&
-      hasMoreHistoryRef.current &&
-      !loadingOlderRef.current &&
-      activeChatRef.current?.roomId
-    ) {
-      loadingOlderRef.current = true;
-      const oldestMsg = messages[0];
-      if (!oldestMsg) {
-        loadingOlderRef.current = false;
+        !payload ||
+        (activeRoom && payload.room && payload.room !== activeRoom)
+      )
         return;
+      const hist = Array.isArray(payload.history) ? payload.history : [];
+      setMessages(hist);
+      setHasMoreMessages(hist.length >= 50);
+      setIsLoadingOlder(false);
+
+      const lastIncoming = [...hist]
+        .reverse()
+        .find(
+          (m) =>
+            m.sender !== currentUserRef.current &&
+            (!currentUserIdRef.current ||
+              String(m.senderId) !== String(currentUserIdRef.current)),
+        );
+      if (lastIncoming?.id && payload.room) {
+        socket.emit("mark_read", {
+          room: payload.room,
+          upToMessageId: lastIncoming.id,
+        });
       }
-      const requestedRoom = activeChatRef.current.roomId;
-      socket.emit(
-        "load_older_messages",
-        {
-          room: requestedRoom,
-          before: oldestMsg.createdAt,
-          beforeId: oldestMsg._id || oldestMsg.id,
-        },
-        (res) => {
-          loadingOlderRef.current = false;
-          if (activeChatRef.current?.roomId !== requestedRoom) return;
-          if (res?.success && res.history?.length) {
-            hasMoreHistoryRef.current = res.hasMore;
-            const prevScrollHeight = node.scrollHeight;
-            setMessages((list) => {
-              const existingIds = new Set(list.map((m) => m.id));
-              const uniqueOlder = res.history.filter(
-                (m) => !existingIds.has(m.id)
-              );
-              return [...uniqueOlder, ...list];
-            });
-            requestAnimationFrame(() => {
-              if (messagesContainerRef.current) {
-                messagesContainerRef.current.scrollTop =
-                  messagesContainerRef.current.scrollHeight - prevScrollHeight;
-              }
-            });
-          } else {
-            hasMoreHistoryRef.current = false;
-          }
-        }
+    },
+    onReceiveMessage: (msg) => {
+      const activeRoom =
+        currentRoomIdRef.current ||
+        computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+      if (!activeRoom || msg.room !== activeRoom) return;
+
+      setMessages((prev) => {
+        const filtered = prev.filter((item) => {
+          if (!item.pending) return true;
+          if (
+            msg.clientMessageId &&
+            item.clientMessageId === msg.clientMessageId
+          )
+            return false;
+          if (
+            item.text &&
+            msg.text &&
+            item.text === msg.text &&
+            item.sender === msg.sender
+          )
+            return false;
+          return true;
+        });
+        const exists = filtered.some(
+          (item) =>
+            (msg.id && item.id === msg.id) || (msg._id && item._id === msg._id),
+        );
+        if (exists) return filtered;
+        return [...filtered, msg];
+      });
+
+      const isFromMe =
+        (currentUserIdRef.current &&
+          msg.senderId &&
+          String(msg.senderId) === String(currentUserIdRef.current)) ||
+        msg.sender === currentUserRef.current;
+      if (!isFromMe && msg.id) {
+        socket.emit("mark_read", { room: msg.room, upToMessageId: msg.id });
+      }
+    },
+    onMessageUpdated: (payload) => {
+      const updated = payload?.message || payload;
+      if (!updated) return;
+      const activeRoom =
+        currentRoomIdRef.current ||
+        computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+      if (payload?.room && activeRoom && payload.room !== activeRoom) return;
+
+      setMessages((prev) =>
+        prev.map((m) =>
+          (updated.id && m.id === updated.id) ||
+          (updated._id && m._id === updated._id)
+            ? { ...m, ...updated }
+            : m,
+        ),
       );
-    }
-  };
+    },
+    onMessageDeleted: (payload) => {
+      const targetId = payload?.msgId || payload?.id;
+      if (!targetId) return;
+      const activeRoom =
+        currentRoomIdRef.current ||
+        computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+      if (payload?.room && activeRoom && payload.room !== activeRoom) return;
 
-  const closeActiveChat = () => {
-    if (activeChat?.id) {
-      const chatKey = `${activeChat.isGroup ? "g" : "u"}:${activeChat.id}`;
-      draftsRef.current[chatKey] = message;
-    }
-    if (activeChat?.roomId) {
-      socket.emit("stop_typing", { room: activeChat.roomId });
-      socket.emit("leave_room", { room: activeChat.roomId });
-    }
-    setActiveChat(null);
-    activeChatRef.current = null;
-    setMessages([]);
-    setEditingMsgId(null);
-    setReplyingToMsg(null);
-    setMessage("");
-  };
+      setMessages((prev) =>
+        prev.filter((m) => m.id !== targetId && m._id !== targetId),
+      );
+    },
+    onMessagesRead: (payload) => {
+      if (!payload) return;
+      const activeRoom =
+        currentRoomIdRef.current ||
+        computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+      if (payload.room && activeRoom && payload.room !== activeRoom) return;
 
-  const handleAuth = (e) => {
-    e.preventDefault();
+      setMessages((prev) => {
+        let reachedTarget = !payload.upToMessageId;
+        return prev.map((m) => {
+          const isMine =
+            (currentUserIdRef.current &&
+              m.senderId &&
+              String(m.senderId) === String(currentUserIdRef.current)) ||
+            m.sender === currentUserRef.current;
+          if (isMine && !reachedTarget) {
+            if (m.id === payload.upToMessageId) reachedTarget = true;
+            return { ...m, isRead: true };
+          }
+          if (isMine && reachedTarget) {
+            return { ...m, isRead: true };
+          }
+          return m;
+        });
+      });
+    },
+    onChatDeleted: (payload) => {
+      const deletedRoom = payload?.room;
+      const activeRoom =
+        currentRoomIdRef.current ||
+        computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+      if (deletedRoom && activeRoom === deletedRoom) {
+        setActiveChat(null);
+        setCurrentRoomId("");
+        setMessages([]);
+        setChatError(tRef.current("chatDeletedNotice"));
+      }
+      setGroupInfoTarget(null);
+    },
+    onDisplayTyping: ({ username, room }) => {
+      if (!room || !username) return;
+      setTypingByRoom((prev) => {
+        const list = prev[room] || [];
+        if (list.includes(username)) return prev;
+        return { ...prev, [room]: [...list, username] };
+      });
+    },
+    onHideTyping: ({ username, room }) => {
+      if (!room || !username) return;
+      setTypingByRoom((prev) => {
+        const list = prev[room] || [];
+        return { ...prev, [room]: list.filter((u) => u !== username) };
+      });
+    },
+  });
+
+  const handleAuthSuccess = ({ username, userId, token, avatar, bio }) => {
+    setCurrentUser(username);
+    setCurrentUserId(userId);
+    setAuthToken(token);
+    setMyAvatar(avatar || "");
+    setMyBio(bio || DEFAULT_BIO);
     setAuthError("");
-    const eventName = isRegistering ? "register" : "login";
-    socket.emit(eventName, { username: username.trim(), password }, (res) => {
-      if (!res || !res.success) {
-        setAuthError(res?.message || "Kirishda xatolik yuz berdi.");
-        return;
-      }
-      if (!res.token) {
-        setAuthError("Server xavfsiz sessiya tokenini qaytarmadi.");
-        return;
-      }
-      localStorage.setItem("chat_token", res.token);
-      localStorage.setItem("chat_username", res.user.username);
-      socket.auth = { token: res.token };
-      setUsername(res.user.username);
-      setUserId(res.user.id || res.user.userId || "");
-      setIsLoggedIn(true);
-      setNewUsername(res.user.username);
-      setAvatar(res.user.avatar || "");
-      setBio(res.user.bio || "");
+    setChatError("");
+
+    sessionStorage.setItem("chat_token", token);
+    sessionStorage.setItem("chat_user", username);
+    if (userId) sessionStorage.setItem("chat_user_id", userId);
+
+    bumpRoomGeneration();
+    socket.auth = { token };
+    if (socket.connected) {
       socket.disconnect();
-      socket.connect();
-    });
+    }
+    socket.connect();
   };
 
   const handleLogout = () => {
     const finishLogout = () => {
-      resetToLogin();
-      socket.disconnect();
-      socket.connect();
+      sessionStorage.removeItem("chat_token");
+      sessionStorage.removeItem("chat_user");
+      sessionStorage.removeItem("chat_user_id");
+      localStorage.removeItem("chat_token");
+      localStorage.removeItem("chat_user");
+      localStorage.removeItem("chat_user_id");
+      bumpRoomGeneration();
+      clearSessionState();
+      if (socket.connected) {
+        socket.disconnect();
+      }
     };
-    if (socket.connected) socket.emit("logout", {}, finishLogout);
-    else finishLogout();
-  };
 
-  // Rule 5: Server sends ack first, then disconnects; frontend cleans up state cleanly
-  const handleDeleteAccount = () => {
-    if (
-      window.confirm(
-        "Diqqat! Akkauntingiz va barcha xabarlaringiz butunlay o'chib ketadi. Rozimisiz?"
-      )
-    ) {
-      socket.emit("delete_account", {}, (res) => {
-        if (res?.success) {
-          resetToLogin();
-          socket.disconnect();
-          socket.connect();
-        } else {
-          alert(res?.message || "Akkauntni o‘chirishda xatolik!");
+    if (socket.connected) {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          finishLogout();
+        }
+      }, 1500);
+
+      socket.emit("logout", {}, () => {
+        clearTimeout(timer);
+        if (!settled) {
+          settled = true;
+          finishLogout();
         }
       });
+    } else {
+      finishLogout();
     }
   };
 
-  const handleSelectChat = (chatItem, isGroup = false) => {
-    // Save current draft before switching chat (Rule 2)
-    if (activeChat?.id && !editingMsgId) {
-      const prevKey = `${activeChat.isGroup ? "g" : "u"}:${activeChat.id}`;
-      draftsRef.current[prevKey] = message;
+  const handleSelectChat = (chat) => {
+    setChatError("");
+    const prevRoom = currentRoomIdRef.current;
+    if (prevRoom && socket.connected) {
+      socket.emit("leave_room", { room: prevRoom });
     }
 
-    if (activeChat?.roomId) {
-      socket.emit("stop_typing", { room: activeChat.roomId });
-      socket.emit("leave_room", { room: activeChat.roomId });
-    }
-
-    const chatName = chatItem.name || chatItem.username;
-    const targetId = chatItem.id || chatItem.groupId || chatItem.userId;
-    setHiddenChats((prev) => prev.filter((n) => n !== chatName));
-
-    const chatData = {
-      name: chatName,
-      id: targetId,
-      isGroup,
-      avatar: chatItem.avatar || "",
-      roomId: null,
-    };
-    activeChatRef.current = chatData;
-    setActiveChat(chatData);
+    bumpRoomGeneration();
+    setActiveChat(chat);
     setMessages([]);
-    hasMoreHistoryRef.current = true;
-    loadingOlderRef.current = false;
+    setHasMoreMessages(false);
+    setIsLoadingOlder(false);
 
-    const nextKey = `${isGroup ? "g" : "u"}:${targetId}`;
-    setMessage(draftsRef.current[nextKey] || "");
-    setTypingStatus("");
-    setEditingMsgId(null);
-    setReplyingToMsg(null);
+    const predictedRoom = computeRoomIdForChat(chat, currentUserId);
+    setCurrentRoomId(predictedRoom);
 
-    socket.emit(
-      "join_room",
-      { target: targetId || chatName, isGroup },
+    if (socket.connected) {
+      socket.emit(
+        "join_room",
+        { target: chat.id || chat.name, isGroup: !!chat.isGroup },
+        (res) => {
+          if (res && !res.success) {
+            setChatError(res.message || t("joinFailedError"));
+          }
+        },
+      );
+    }
+  };
+
+  const handleLoadOlder = () => {
+    if (isLoadingOlder || !hasMoreMessages || messages.length === 0) return;
+    const oldest = messages[0];
+    const room =
+      currentRoomIdRef.current ||
+      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+    if (!room) return;
+
+    setIsLoadingOlder(true);
+    requestOlderMessages(
+      {
+        room,
+        before: oldest.createdAt || null,
+        beforeId: oldest._id || null,
+      },
       (res) => {
-        // Ignore stale join response if user already switched to another chat (Rule 7)
-        if (
-          activeChatRef.current?.id !== targetId ||
-          activeChatRef.current?.isGroup !== isGroup
-        ) {
-          return;
+        setIsLoadingOlder(false);
+        if (res?.success && Array.isArray(res.history)) {
+          setMessages((prev) => {
+            const existingIds = new Set(prev.map((m) => m.id || m._id));
+            const uniqueOlder = res.history.filter(
+              (m) => !existingIds.has(m.id || m._id),
+            );
+            return [...uniqueOlder, ...prev];
+          });
+          setHasMoreMessages(!!res.hasMore);
         }
-        if (!res?.success) {
-          setActiveChat(null);
-          activeChatRef.current = null;
-          alert(res?.message || "Chatni ochib bo‘lmadi.");
-        } else {
-          const next = { ...chatData, roomId: res.room };
-          activeChatRef.current = next;
-          setActiveChat(next);
-          setChatSummaries((prev) => ({
-            ...prev,
-            [res.room]: { ...(prev[res.room] || {}), unreadCount: 0 },
-          }));
-        }
-      }
+      },
     );
   };
 
-  const handleMessageChange = (e) => {
-    const val = e.target.value;
-    setMessage(val);
-    if (activeChat?.id && !editingMsgId) {
-      const chatKey = `${activeChat.isGroup ? "g" : "u"}:${activeChat.id}`;
-      draftsRef.current[chatKey] = val;
-    }
-    if (activeChat) {
-      const roomName = activeChat.roomId;
-      if (val.trim().length > 0) {
-        if (roomName) socket.emit("typing", { room: roomName });
-        if (clientTypingTimeoutRef.current)
-          clearTimeout(clientTypingTimeoutRef.current);
-        clientTypingTimeoutRef.current = setTimeout(() => {
-          if (roomName) socket.emit("stop_typing", { room: roomName });
-        }, 2000);
-      } else {
-        if (roomName) socket.emit("stop_typing", { room: roomName });
-      }
-    }
-  };
+  const handleSendMessage = ({ text, file, fileName, fileType, replyTo }) => {
+    const chat = activeChatRef.current;
+    if (!chat) return;
+    setChatError("");
 
-  // Rule 2: Give every new message a unique clientMessageId per chat & preserve typed text on delay/switch/failure
-  const sendMessage = (e) => {
-    e.preventDefault();
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    if (clientTypingTimeoutRef.current)
-      clearTimeout(clientTypingTimeoutRef.current);
-    if (!message.trim() || !activeChat) return;
+    const clientMessageId = createClientMsgId();
+    const room =
+      currentRoomIdRef.current ||
+      computeRoomIdForChat(chat, currentUserIdRef.current);
+    const nowTime = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
 
-    const targetChat = { ...activeChat };
-    const roomName = targetChat.roomId;
-    const chatKey = `${targetChat.isGroup ? "g" : "u"}:${targetChat.id}`;
-    const textToSend = message;
+    const optimisticMsg = {
+      id: clientMessageId,
+      clientMessageId,
+      room,
+      senderId: currentUserIdRef.current,
+      sender: currentUserRef.current,
+      receiver: chat.name,
+      text: text || "",
+      file: file || null,
+      fileName: fileName || "",
+      fileType: fileType || "",
+      time: nowTime,
+      isRead: false,
+      isEdited: false,
+      replyTo: replyTo || null,
+      reactions: {},
+      pending: true,
+    };
 
-    if (roomName) socket.emit("stop_typing", { room: roomName });
+    setMessages((prev) => [...prev, optimisticMsg]);
 
-    if (editingMsgId) {
-      socket.emit(
-        "edit_message",
-        { msgId: editingMsgId, newText: textToSend, room: roomName },
-        (res) => {
-          if (!res?.success) {
-            alert(res?.message || "Xabarni tahrirlab bo‘lmadi.");
-            return;
-          }
-          if (activeChatRef.current?.id === targetChat.id) {
-            setEditingMsgId(null);
-            setMessage("");
-          }
-        }
+    if (!socket.connected) {
+      setChatError(t("disconnectedError"));
+      setMessages((prev) =>
+        prev.filter((m) => m.clientMessageId !== clientMessageId),
       );
       return;
     }
 
-    if (!pendingIdsRef.current[chatKey]) {
-      pendingIdsRef.current[chatKey] =
-        globalThis.crypto?.randomUUID?.() ||
-        `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    }
-    const clientMessageId = pendingIdsRef.current[chatKey];
-
-    const messageData = {
-      target: targetChat.id || targetChat.name,
-      groupId: targetChat.isGroup ? targetChat.id : undefined,
-      text: textToSend,
-      clientMessageId,
-      file: null,
-      fileName: null,
-      fileType: null,
-      isGroup: targetChat.isGroup,
-      replyTo: replyingToMsg
-        ? { sender: replyingToMsg.sender, text: replyingToMsg.text || "Fayl" }
-        : null,
-    };
-
-    socket.emit("send_message", messageData, (res) => {
-      if (!res?.success) {
-        alert(res?.message || "Xabar yuborilmadi. Matn saqlab qolindi.");
-        return;
-      }
-      delete pendingIdsRef.current[chatKey];
-      delete draftsRef.current[chatKey];
-      if (activeChatRef.current?.id === targetChat.id) {
-        setMessage((prev) => (prev === textToSend ? "" : prev));
-        setReplyingToMsg(null);
-        setShowEmojiPicker(false);
-      }
-    });
+    socket.emit(
+      "send_message",
+      {
+        clientMessageId,
+        target: chat.id || chat.name,
+        groupId: chat.isGroup ? chat.id : undefined,
+        isGroup: !!chat.isGroup,
+        text: text || "",
+        file: file || null,
+        fileName: fileName || "",
+        fileType: fileType || "",
+        replyTo: replyTo || null,
+      },
+      (res) => {
+        if (!res?.success) {
+          setMessages((prev) =>
+            prev.filter((m) => m.clientMessageId !== clientMessageId),
+          );
+          setChatError(res?.message || t("sendFailedError"));
+          return;
+        }
+        if (res.message) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.clientMessageId === clientMessageId
+                ? { ...res.message, pending: false }
+                : m,
+            ),
+          );
+        }
+      },
+    );
   };
 
-  const handleContextMenu = (e, msg) => {
-    e.preventDefault();
-    setContextMenu({ x: e.pageX, y: e.pageY, msg });
+  const handleEditMessage = (msgId, newText) => {
+    const room =
+      currentRoomIdRef.current ||
+      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+    socket.emit("edit_message", { msgId, newText, room }, (res) => {
+      if (!res?.success) {
+        setChatError(res?.message || t("sendFailedError"));
+      }
+    });
   };
 
   const handleDeleteMessage = (msgId) => {
-    if (activeChat) {
-      socket.emit(
-        "delete_message",
-        { msgId, room: activeChat.roomId },
-        (res) => {
-          if (res && !res.success) alert(res.message);
-        }
-      );
-    }
-    setContextMenu(null);
-  };
-
-  const handleStartEdit = (msg) => {
-    setEditingMsgId(msg.id);
-    setMessage(msg.text);
-    setContextMenu(null);
-  };
-
-  const handleStartReply = (msg) => {
-    setReplyingToMsg(msg);
-    setContextMenu(null);
+    const room =
+      currentRoomIdRef.current ||
+      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+    socket.emit("delete_message", { msgId, room }, (res) => {
+      if (!res?.success) {
+        setChatError(res?.message || t("sendFailedError"));
+      }
+    });
   };
 
   const handleToggleReaction = (msgId, emoji) => {
-    if (activeChat) {
-      socket.emit(
-        "toggle_reaction",
-        { msgId, emoji, room: activeChat.roomId },
-        (res) => {
-          if (res && !res.success) alert(res.message);
-        }
-      );
-    }
-    setReactionPickerMsgId(null);
+    const room =
+      currentRoomIdRef.current ||
+      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+    socket.emit("toggle_reaction", { msgId, emoji, room }, (res) => {
+      if (!res?.success) {
+        setChatError(res?.message || t("sendFailedError"));
+      }
+    });
   };
 
   const handleClearChat = () => {
-    if (!activeChat) return;
-    if (window.confirm("Haqiqatan ham chat tarixini tozalamoqchimisiz?")) {
-      socket.emit("clear_chat", { room: activeChat.roomId }, (res) => {
-        if (res && !res.success) alert(res.message);
-      });
-    }
-  };
-
-  const handleDeleteChat = () => {
-    if (!activeChat) return;
-    if (
-      window.confirm(
-        "Haqiqatan ham ushbu chatni ro‘yxatingizdan olib tashlamoqchimisiz?"
-      )
-    ) {
-      setHiddenChats((prev) => [...prev, activeChat.name]);
-      closeActiveChat();
-    }
-  };
-
-  const handleLeaveOrDeleteGroup = () => {
-    if (!activeChat || !activeChat.isGroup) return;
-    const isConfirm = window.confirm(
-      "Guruhdan chiqmoqchimisiz yoki o'chirmoqchimisiz?"
-    );
-    if (isConfirm) {
-      socket.emit(
-        "delete_or_leave_group",
-        { groupId: activeChat.id },
-        (res) => {
-          if (res?.success) {
-            setHiddenChats((prev) => [...prev, activeChat.name]);
-            closeActiveChat();
-          } else {
-            alert(res?.message || "Guruhdan chiqishda xatolik.");
-          }
-        }
-      );
-    }
-  };
-
-  const handleCreateGroup = (e) => {
-    e.preventDefault();
-    if (newGroupName.trim()) {
-      socket.emit(
-        "create_group",
-        { groupName: newGroupName.trim(), members: selectedGroupMembers },
-        (res) => {
-          if (res?.success) {
-            setIsCreateGroupOpen(false);
-            setNewGroupName("");
-            setSelectedGroupMembers([]);
-            handleSelectChat(res.group, true);
-          } else {
-            alert(res?.message || "Guruh yaratishda xatolik.");
-          }
-        }
-      );
-    }
-  };
-
-  const addEmoji = (emo) => setMessage((prev) => prev + emo);
-
-  const openPrivateFile = async (fileUrl, fileName) => {
-    try {
-      const response = await fetch(`${SERVER_URL}${fileUrl}`, {
-        headers: {
-          Authorization: `Bearer ${localStorage.getItem("chat_token") || ""}`,
-        },
-      });
-      if (!response.ok)
-        throw new Error("Faylni olish huquqi yo‘q yoki fayl topilmadi.");
-      const blob = await response.blob();
-      const objectUrl = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = objectUrl;
-      link.download = fileName || "download";
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-    } catch (error) {
-      alert(error.message || "Faylni yuklab bo‘lmadi.");
-    }
-  };
-
-  useEffect(() => {
-    let cancelled = false;
-    const token = localStorage.getItem("chat_token") || "";
-    const pending = (messages || []).filter(
-      (msg) =>
-        typeof msg.file === "string" &&
-        msg.file.startsWith("/api/files/") &&
-        !privateFileUrls[msg.id]
-    );
-    Promise.all(
-      pending.map(async (msg) => {
-        try {
-          const response = await fetch(`${SERVER_URL}${msg.file}`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          if (!response.ok) return null;
-          return [msg.id, URL.createObjectURL(await response.blob())];
-        } catch (error) {
-          return null;
-        }
-      })
-    ).then((entries) => {
-      if (cancelled) {
-        entries.filter(Boolean).forEach(([, url]) => URL.revokeObjectURL(url));
-        return;
+    const room =
+      currentRoomIdRef.current ||
+      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+    if (!room) return;
+    socket.emit("clear_chat", { room }, (res) => {
+      if (!res?.success) {
+        setChatError(res?.message || t("sendFailedError"));
       }
-      const available = Object.fromEntries(entries.filter(Boolean));
-      if (Object.keys(available).length)
-        setPrivateFileUrls((current) => ({ ...current, ...available }));
     });
-    return () => {
-      cancelled = true;
-    };
-  }, [messages, privateFileUrls]);
-
-  const handleFileUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file || !activeChat) return;
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      alert(t.fileTooLarge);
-      e.target.value = "";
-      return;
-    }
-    try {
-      const response = await fetch(`${SERVER_URL}/api/files`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${localStorage.getItem("chat_token") || ""}`,
-          "Content-Type": "application/octet-stream",
-          "X-File-Type": file.type || "application/octet-stream",
-          "X-File-Name": encodeURIComponent(file.name),
-          "X-Chat-Target": activeChat.id || activeChat.name,
-          "X-Chat-Group": String(!!activeChat.isGroup),
-        },
-        body: file,
-      });
-      const uploaded = await response.json();
-      if (!response.ok || !uploaded.success)
-        throw new Error(uploaded.message || "Fayl yuklanmadi.");
-      const messageData = {
-        target: activeChat.id || activeChat.name,
-        groupId: activeChat.isGroup ? activeChat.id : undefined,
-        text: "",
-        file: uploaded.file,
-        fileName: uploaded.fileName,
-        fileType: uploaded.fileType,
-        clientMessageId:
-          globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
-        isGroup: activeChat.isGroup,
-        replyTo: replyingToMsg
-          ? { sender: replyingToMsg.sender, text: replyingToMsg.text || "Fayl" }
-          : null,
-      };
-      socket.emit("send_message", messageData, (res) => {
-        if (!res?.success) {
-          alert(res?.message || "Fayl xabarga biriktirilmadi.");
-          return;
-        }
-        setReplyingToMsg(null);
-        e.target.value = "";
-      });
-    } catch (error) {
-      alert(error.message || "Fayl yuborilmadi.");
-    }
   };
 
-  // Rule 12: Upload avatar as a standalone file via HTTP, never Base64 over socket/localStorage
-  const handleAvatarUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      alert(t.fileTooLarge);
-      e.target.value = "";
-      return;
-    }
-    try {
-      const response = await fetch(`${SERVER_URL}/api/avatar`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${localStorage.getItem("chat_token") || ""}`,
-          "Content-Type": "application/octet-stream",
-          "X-File-Type": file.type || "application/octet-stream",
-          "X-File-Name": encodeURIComponent(file.name),
-        },
-        body: file,
-      });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.message || "Avatarni yuklab bo‘lmadi.");
+  const handleCreateGroup = (groupName, members, cb) => {
+    socket.emit("create_group", { groupName, members }, (res) => {
+      cb?.(res);
+    });
+  };
+
+  const handleSaveProfile = ({ newUsername, bio, avatar }, cb) => {
+    socket.emit("update_profile", { newUsername, bio }, (res) => {
+      if (res?.success) {
+        const updatedName =
+          res.newUsername || res.user?.username || newUsername;
+        setCurrentUser(updatedName);
+        setMyBio(res.user?.bio ?? bio);
+        if (avatar) setMyAvatar(avatar);
+        sessionStorage.setItem("chat_user", updatedName);
       }
-      setAvatar(data.avatar);
-      e.target.value = "";
-    } catch (error) {
-      alert(error.message || "Avatar yuklashda xatolik.");
-    }
+      cb?.(res);
+    });
   };
 
-  const handleSaveProfile = (e) => {
-    e.preventDefault();
+  const handleDeleteAccount = (cb) => {
+    socket.emit("delete_account", {}, (res) => {
+      cb?.(res);
+      if (res?.success) {
+        sessionStorage.removeItem("chat_token");
+        sessionStorage.removeItem("chat_user");
+        sessionStorage.removeItem("chat_user_id");
+        localStorage.removeItem("chat_token");
+        localStorage.removeItem("chat_user");
+        localStorage.removeItem("chat_user_id");
+        bumpRoomGeneration();
+        clearSessionState(t("accountDeletedNotice"));
+        if (socket.connected) socket.disconnect();
+      }
+    });
+  };
+
+  const handleRemoveGroupMember = (
+    { groupId, groupName, memberId, memberUsername },
+    cb,
+  ) => {
     socket.emit(
-      "update_profile",
-      { newUsername, bio },
+      "remove_group_member",
+      { groupId, groupName, memberId, memberUsername },
       (res) => {
-        if (res?.success) {
-          localStorage.setItem("chat_username", res.newUsername);
-          setUsername(res.newUsername);
-          localStorage.setItem("chat_bio", bio);
-          setIsSettingsOpen(false);
-        } else {
-          alert(res?.message || "Profilni saqlashda xatolik.");
-        }
-      }
+        cb?.(res);
+      },
     );
   };
 
-  const toggleTheme = () =>
-    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
-
-  const filteredUsers = allUsers
-    .filter((u) => String(u.id || u.userId) !== String(userId))
-    .filter((u) => {
-      const matchesSearch = u.username
-        .toLowerCase()
-        .includes(searchQuery.toLowerCase());
-      const isHidden = hiddenChats.includes(u.username);
-      if (searchQuery.trim() !== "") return matchesSearch;
-      return matchesSearch && !isHidden;
+  const handleDeleteOrLeaveGroup = (groupIdOrName, isAdmin) => {
+    const payload = { groupId: groupIdOrName, groupName: groupIdOrName };
+    socket.emit("delete_or_leave_group", payload, (res) => {
+      if (!res?.success) {
+        setChatError(res?.message || t("sendFailedError"));
+      }
     });
+  };
 
-  const filteredGroups = allGroups.filter((g) => {
-    const isMember =
-      (g.memberIds || []).map(String).includes(String(userId)) ||
-      String(g.adminId || "") === String(userId);
-    if (!isMember) return false;
-    const matchesSearch = g.name
-      .toLowerCase()
-      .includes(searchQuery.toLowerCase());
-    const isHidden = hiddenChats.includes(g.name);
-    if (searchQuery.trim() !== "") return matchesSearch;
-    return matchesSearch && !isHidden;
-  });
+  const handleTyping = () => {
+    const room = currentRoomIdRef.current;
+    if (room && socket.connected) socket.emit("typing", { room });
+  };
 
-  if (!isLoggedIn) {
+  const handleStopTyping = () => {
+    const room = currentRoomIdRef.current;
+    if (room && socket.connected) socket.emit("stop_typing", { room });
+  };
+
+  if (!authToken || !currentUser) {
     return (
       <AuthScreen
-        theme={theme}
-        handleAuth={handleAuth}
-        isRegistering={isRegistering}
-        setIsRegistering={setIsRegistering}
-        authError={authError}
-        setAuthError={setAuthError}
-        username={username}
-        setUsername={setUsername}
-        password={password}
-        setPassword={setPassword}
+        onAuthSuccess={handleAuthSuccess}
+        initialError={authError}
+        t={t}
       />
     );
   }
 
-  const currentPartner =
-    activeChat && !activeChat.isGroup
-      ? allUsers.find(
-          (u) =>
-            String(u.id || u.userId) === String(activeChat.id) ||
-            u.username === activeChat.name
-        )
-      : null;
+  const activeRoom =
+    currentRoomId || computeRoomIdForChat(activeChat, currentUserId);
+  const currentTypingUsers = activeRoom ? typingByRoom[activeRoom] || [] : [];
 
   return (
-    <div
-      className={`telegram-app ${theme} ${wallpaper} ${
-        activeChat ? "chat-active" : ""
-      }`}
-    >
+    <div className={`app-shell ${activeChat ? "has-active-chat" : ""}`}>
       <Sidebar
-        username={username}
-        userId={userId}
-        avatar={avatar}
-        t={t}
-        theme={theme}
-        toggleTheme={toggleTheme}
-        setIsCreateGroupOpen={setIsCreateGroupOpen}
-        setIsSettingsOpen={setIsSettingsOpen}
-        searchQuery={searchQuery}
-        setSearchQuery={setSearchQuery}
-        filteredGroups={filteredGroups}
-        filteredUsers={filteredUsers}
+        currentUser={currentUser}
+        currentUserId={currentUserId}
+        myAvatar={myAvatar}
+        users={users}
+        groups={groups}
         activeChat={activeChat}
-        handleSelectChat={handleSelectChat}
-        typingUsers={typingUsers}
-        chatSummaries={chatSummaries}
+        onSelectChat={handleSelectChat}
+        onOpenCreateGroup={() => setShowCreateGroup(true)}
+        onOpenProfile={() => setShowProfileModal(true)}
+        onOpenSettings={() => setShowSettingsModal(true)}
+        onLogout={handleLogout}
+        summaries={summaries}
+        isConnected={isConnected}
+        t={t}
       />
 
       <ChatArea
         activeChat={activeChat}
-        closeActiveChat={closeActiveChat}
-        currentPartner={currentPartner}
-        typingStatus={typingStatus}
-        t={t}
-        handleClearChat={handleClearChat}
-        handleLeaveOrDeleteGroup={handleLeaveOrDeleteGroup}
-        handleDeleteChat={handleDeleteChat}
-        messagesContainerRef={messagesContainerRef}
-        handleMessagesScroll={handleMessagesScroll}
+        currentUser={currentUser}
+        currentUserId={currentUserId}
         messages={messages}
-        userId={userId}
-        username={username}
-        handleContextMenu={handleContextMenu}
-        privateFileUrls={privateFileUrls}
-        setActiveMedia={setActiveMedia}
-        openPrivateFile={openPrivateFile}
-        handleToggleReaction={handleToggleReaction}
-        reactionPickerMsgId={reactionPickerMsgId}
-        setReactionPickerMsgId={setReactionPickerMsgId}
-        messagesEndRef={messagesEndRef}
-        contextMenu={contextMenu}
-        handleStartReply={handleStartReply}
-        handleStartEdit={handleStartEdit}
-        handleDeleteMessage={handleDeleteMessage}
-        replyingToMsg={replyingToMsg}
-        setReplyingToMsg={setReplyingToMsg}
-        editingMsgId={editingMsgId}
-        setEditingMsgId={setEditingMsgId}
-        setMessage={setMessage}
-        sendMessage={sendMessage}
-        showEmojiPicker={showEmojiPicker}
-        setShowEmojiPicker={setShowEmojiPicker}
-        addEmoji={addEmoji}
-        handleFileUpload={handleFileUpload}
-        message={message}
-        handleMessageChange={handleMessageChange}
+        typingUsers={currentTypingUsers}
+        users={users}
+        groups={groups}
+        onSendMessage={handleSendMessage}
+        onEditMessage={handleEditMessage}
+        onDeleteMessage={handleDeleteMessage}
+        onToggleReaction={handleToggleReaction}
+        onClearChat={handleClearChat}
+        onDeleteOrLeaveGroup={handleDeleteOrLeaveGroup}
+        onOpenGroupInfo={(grp) => setGroupInfoTarget(grp)}
+        onTyping={handleTyping}
+        onStopTyping={handleStopTyping}
+        onLoadOlder={handleLoadOlder}
+        hasMoreMessages={hasMoreMessages}
+        isLoadingOlder={isLoadingOlder}
+        onPreviewMedia={(url, name) => setMediaViewer({ url, fileName: name })}
+        onBackToList={() => {
+          const prevRoom = currentRoomIdRef.current;
+          if (prevRoom && socket.connected)
+            socket.emit("leave_room", { room: prevRoom });
+          bumpRoomGeneration();
+          setActiveChat(null);
+          setCurrentRoomId("");
+          setMessages([]);
+        }}
+        wallpaper={wallpaper}
+        soundEnabled={soundEnabled}
+        chatError={chatError}
+        onClearChatError={() => setChatError("")}
+        token={authToken}
+        t={t}
       />
 
-      <Modals
-        isCreateGroupOpen={isCreateGroupOpen}
-        setIsCreateGroupOpen={setIsCreateGroupOpen}
-        handleCreateGroup={handleCreateGroup}
-        t={t}
-        newGroupName={newGroupName}
-        setNewGroupName={setNewGroupName}
-        allUsers={allUsers}
-        userId={userId}
-        selectedGroupMembers={selectedGroupMembers}
-        setSelectedGroupMembers={setSelectedGroupMembers}
-        isSettingsOpen={isSettingsOpen}
-        setIsSettingsOpen={setIsSettingsOpen}
-        avatar={avatar}
-        username={username}
-        handleSaveProfile={handleSaveProfile}
-        handleAvatarUpload={handleAvatarUpload}
-        newUsername={newUsername}
-        setNewUsername={setNewUsername}
-        bio={bio}
-        setBio={setBio}
-        theme={theme}
-        setTheme={setTheme}
-        wallpaper={wallpaper}
-        setWallpaper={setWallpaper}
-        notifications={notifications}
-        setNotifications={setNotifications}
-        language={language}
-        setLanguage={setLanguage}
-        handleLogout={handleLogout}
-        handleDeleteAccount={handleDeleteAccount}
-        activeMedia={activeMedia}
-        setActiveMedia={setActiveMedia}
-      />
+      {showCreateGroup && (
+        <CreateGroupModal
+          users={users}
+          currentUser={currentUser}
+          currentUserId={currentUserId}
+          onClose={() => setShowCreateGroup(false)}
+          onCreate={handleCreateGroup}
+          t={t}
+        />
+      )}
+
+      {showProfileModal && (
+        <ProfileModal
+          currentUser={currentUser}
+          currentUserId={currentUserId}
+          avatar={myAvatar}
+          bio={myBio}
+          token={authToken}
+          onClose={() => setShowProfileModal(false)}
+          onSaveProfile={handleSaveProfile}
+          onDeleteAccount={handleDeleteAccount}
+          t={t}
+        />
+      )}
+
+      {groupInfoTarget && (
+        <GroupInfoModal
+          group={
+            groups.find(
+              (g) =>
+                (typeof g === "object" &&
+                  (g.id === groupInfoTarget.id ||
+                    g.name === groupInfoTarget.name)) ||
+                g === groupInfoTarget,
+            ) || groupInfoTarget
+          }
+          currentUser={currentUser}
+          currentUserId={currentUserId}
+          users={users}
+          onClose={() => setGroupInfoTarget(null)}
+          onRemoveMember={handleRemoveGroupMember}
+          onDeleteOrLeave={handleDeleteOrLeaveGroup}
+          t={t}
+        />
+      )}
+
+      {showSettingsModal && (
+        <SettingsModal
+          theme={theme}
+          onToggleTheme={() =>
+            setTheme((prev) => (prev === "dark" ? "light" : "dark"))
+          }
+          wallpaper={wallpaper}
+          onChangeWallpaper={setWallpaper}
+          language={language}
+          onChangeLanguage={setLanguage}
+          soundEnabled={soundEnabled}
+          onToggleSound={() => setSoundEnabled((prev) => !prev)}
+          onClose={() => setShowSettingsModal(false)}
+          t={t}
+        />
+      )}
+
+      {mediaViewer && (
+        <MediaViewerModal
+          mediaUrl={mediaViewer.url}
+          fileName={mediaViewer.fileName}
+          onClose={() => setMediaViewer(null)}
+          t={t}
+        />
+      )}
     </div>
   );
 }
-
-export default App;

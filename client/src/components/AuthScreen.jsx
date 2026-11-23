@@ -1,63 +1,140 @@
-import React from "react";
+import React, { useState } from "react";
+import { socket } from "../utils/socket";
 
-export default function AuthScreen({
-  theme,
-  handleAuth,
-  isRegistering,
-  setIsRegistering,
-  authError,
-  setAuthError,
-  username,
-  setUsername,
-  password,
-  setPassword,
-}) {
+export default function AuthScreen({ onAuthSuccess, initialError = "", t = (k) => k }) {
+  const [isRegister, setIsRegister] = useState(false);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [errorMsg, setErrorMsg] = useState(initialError);
+  const [loading, setLoading] = useState(false);
+
+  React.useEffect(() => {
+    if (initialError) setErrorMsg(initialError);
+  }, [initialError]);
+
+  const validateForm = () => {
+    const cleanName = username.trim();
+    if (!cleanName || !password) {
+      return t("errEnterCredentials");
+    }
+    if (cleanName.length < 2 || cleanName.length > 32) {
+      return t("errUsernameLength");
+    }
+    if (password.length < 6) {
+      return t("errPasswordLength");
+    }
+    return "";
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (loading) return;
+    const validationErr = validateForm();
+    if (validationErr) {
+      setErrorMsg(validationErr);
+      return;
+    }
+
+    setErrorMsg("");
+    setLoading(true);
+
+    const doEmit = () => {
+      const eventName = isRegister ? "register" : "login";
+      socket.emit(eventName, { username: username.trim(), password }, (res) => {
+        setLoading(false);
+        if (res?.success) {
+          onAuthSuccess({
+            username: res.user?.username || username.trim(),
+            userId: res.user?.id || res.user?.userId || "",
+            token: res.token,
+            avatar: res.user?.avatar || "",
+            bio: res.user?.bio || ""
+          });
+        } else {
+          setErrorMsg(res?.message || t("errAuthFailed"));
+        }
+      });
+    };
+
+    if (!socket.connected) {
+      socket.auth = {};
+      socket.once("connect", doEmit);
+      socket.once("connect_error", () => {
+        setLoading(false);
+        setErrorMsg(t("errServerConnect"));
+      });
+      socket.connect();
+    } else {
+      doEmit();
+    }
+  };
+
   return (
-    <div className={`tg-login-container ${theme}`}>
-      <form onSubmit={handleAuth} className="tg-login-card">
-        <div className="tg-logo">
-          <svg viewBox="0 0 24 24" width="64" height="64" fill="#2AABEE">
-            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69.01-.03.01-.14-.07-.2-.08-.06-.19-.04-.27-.02-.12.02-1.96 1.25-5.54 3.69-.52.36-1 .53-1.42.52-.47-.01-1.37-.26-2.03-.48-.82-.27-1.47-.42-1.42-.88.03-.24.38-.49 1.03-.75 4.03-1.75 6.72-2.91 8.07-3.47 3.83-1.6 4.63-1.88 5.15-1.89.11 0 .37.03.54.17.14.12.18.28.2.45-.02.07-.02.13-.03.22z" />
+    <div className="auth-container">
+      <div className="auth-card">
+        <div className="auth-logo-circle">
+          <svg viewBox="0 0 24 24" width="38" height="38" fill="none" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M22 2L11 13" />
+            <path d="M22 2L15 22L11 13L2 9L22 2Z" />
           </svg>
         </div>
-        <h2>Telegram Web Pro</h2>
-        <p className="tg-subtitle">
-          {isRegistering ? "Yangi hisob yaratish" : "Xush kelibsiz"}
+
+        <h1 className="auth-title">Telegram Web Pro</h1>
+        <p className="auth-subtitle">
+          {isRegister ? t("authRegisterSubtitle") : t("authLoginSubtitle")}
         </p>
-        {authError && <div className="tg-error-msg">{authError}</div>}
-        <div className="tg-input-group">
-          <input
-            type="text"
-            placeholder="Foydalanuvchi nomi"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            required
-          />
+
+        {errorMsg && <div className="auth-error-box" role="alert">{errorMsg}</div>}
+
+        <form onSubmit={handleSubmit} className="auth-form" noValidate>
+          <div className="auth-input-group">
+            <label>{t("usernameLabel")}</label>
+            <input
+              type="text"
+              placeholder={t("usernamePlaceholder")}
+              value={username}
+              onChange={(e) => {
+                setUsername(e.target.value);
+                if (errorMsg) setErrorMsg("");
+              }}
+              disabled={loading}
+              autoFocus
+            />
+          </div>
+
+          <div className="auth-input-group">
+            <label>{t("passwordLabel")}</label>
+            <input
+              type="password"
+              placeholder={t("passwordPlaceholder")}
+              value={password}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                if (errorMsg) setErrorMsg("");
+              }}
+              disabled={loading}
+            />
+          </div>
+
+          <button type="submit" className="auth-submit-btn" disabled={loading}>
+            {loading ? t("pleaseWait") : isRegister ? t("registerBtn") : t("loginBtn")}
+          </button>
+        </form>
+
+        <div className="auth-switch-footer">
+          <span>{isRegister ? t("haveAccount") : t("noAccount")}</span>
+          <button
+            type="button"
+            onClick={() => {
+              setIsRegister(!isRegister);
+              setErrorMsg("");
+            }}
+            disabled={loading}
+          >
+            {isRegister ? t("loginBtn") : t("registerBtn")}
+          </button>
         </div>
-        <div className="tg-input-group">
-          <input
-            type="password"
-            placeholder="Parol"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            required
-          />
-        </div>
-        <button type="submit" className="tg-btn">
-          {isRegistering ? "RO'YXATDAN O'TISH" : "KIRISH"}
-        </button>
-        <p
-          className="tg-switch-auth"
-          onClick={() => {
-            setIsRegistering(!isRegistering);
-            setAuthError("");
-          }}
-        >
-          {isRegistering
-            ? "Akkauntingiz bormi? Kirish"
-            : "Hisobingiz yo'qmi? Ro'yxatdan o'tish"}
-        </p>
-      </form>
+      </div>
     </div>
   );
 }

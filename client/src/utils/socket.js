@@ -1,15 +1,10 @@
-import io from "socket.io-client";
-import { SERVER_URL } from "./constants";
+import { io } from "socket.io-client";
+import { API_URL } from "./constants";
 
-export const socket = io(SERVER_URL || undefined, {
+export const socket = io(API_URL, {
   autoConnect: false,
   reconnection: true,
   reconnectionAttempts: Infinity,
-  reconnectionDelay: 1000,
-  auth: { token: localStorage.getItem("chat_token") || "" },
+  reconnectionDelay: 800,
+  reconnectionDelayMax: 4000
 });
-
-export const getPrivateRoomId = (idA, idB) => {
-  const [a, b] = [String(idA), String(idB)].sort();
-  return `dm:${a}:${b}`;
-};
