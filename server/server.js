@@ -6,10 +6,16 @@ const path = require("path");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const mongoose = require("mongoose");
+// Migrations must normalize legacy rows before MongoDB builds unique indexes.
+mongoose.set("autoIndex", false);
 const { hashToken, privateRoomId, groupRoomId } = require("./lib/chat-ids");
-const { User, Message, Group } = require("./models");
+const { User, Session, Message, Group, UploadedFile } = require("./models");
 const { router: filesRouter, AVATAR_DIR } = require("./routes/files");
 const { setupSocketHandlers } = require("./sockets/handlers");
+const { migrateReactionOwners } = require("./lib/legacy-reactions");
+const { dedupeLegacyMessageIdentity } = require("./lib/legacy-message-ids");
+const { migrateLegacyAvatar } = require("./lib/avatar-migration");
+const { dropLegacySparseClientMessageIndex } = require("./lib/message-index-migration");
 
 const envFile = path.join(__dirname, ".env");
 if (fs.existsSync(envFile)) {
@@ -38,22 +44,27 @@ const DB_URI =
   process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/telegram_web_pro";
 const PORT = Number(process.env.PORT || 3001);
 
+const ensureIndexes = async () => {
+  await Promise.all([
+    User.createIndexes(), Session.createIndexes(), Message.createIndexes(),
+    Group.createIndexes(), UploadedFile.createIndexes(),
+  ]);
+};
+
 const { sendDirectory } = setupSocketHandlers(io);
 app.locals.sendDirectory = sendDirectory;
 
-async function migrateLegacyData() {
-  await mongoose.connect(DB_URI);
-  await Message.syncIndexes();
+async function migrateLegacyData({ connect = true, disconnect = true } = {}) {
+  if (connect) await mongoose.connect(DB_URI);
+
+  // Drop only the old sparse compound index. It can index historical rows
+  // that have senderId but no clientMessageId. Keep the message-id index intact.
+  await dropLegacySparseClientMessageIndex(Message.collection);
 
   const users = await User.find({});
-  for (const u of users) {
-    if (typeof u.avatar === "string" && u.avatar.startsWith("data:")) {
-      u.avatar = "";
-      await u.save();
-    }
-  }
-
+  for (const u of users) await migrateLegacyAvatar(u, AVATAR_DIR);
   const byName = new Map(users.map((u) => [u.username, u]));
+  const byId = new Map(users.map((u) => [String(u._id).toLowerCase(), u]));
   const groups = await Group.find({});
 
   for (const group of groups) {
@@ -88,19 +99,7 @@ async function migrateLegacyData() {
     if (sender && !msg.senderId) msg.senderId = sender._id;
     if (receiver && !msg.receiverId) msg.receiverId = receiver._id;
 
-    if (!msg.id || seenMsgIds.has(msg.id)) {
-      msg.id = crypto.randomUUID();
-    }
-    seenMsgIds.add(msg.id);
-
-    if (msg.clientMessageId && msg.senderId) {
-      const pairKey = `${String(msg.senderId)}:${msg.clientMessageId}`;
-      if (seenClientPairs.has(pairKey)) {
-        msg.clientMessageId = undefined;
-      } else {
-        seenClientPairs.add(pairKey);
-      }
-    }
+    dedupeLegacyMessageIdentity(msg, seenMsgIds, seenClientPairs, () => crypto.randomUUID());
 
     if (!msg.room || !msg.room.startsWith("group:")) {
       const group = groups.find((g) => g.name === msg.room);
@@ -117,11 +116,26 @@ async function migrateLegacyData() {
 
     if (sender) msg.sender = sender.username;
     if (receiver) msg.receiver = receiver.username;
+
+    // Legacy reactions stored usernames. Convert only exact, uniquely-resolved
+    // usernames to immutable user IDs; unknown values are retained for audit.
+    if (msg.reactions) {
+      const { migrated, unresolved } = migrateReactionOwners(msg.reactions, byName, byId);
+      msg.reactions = migrated;
+      if (unresolved.length) {
+        msg.legacyReactionsUnresolved = [
+          ...(msg.legacyReactionsUnresolved || []),
+          ...unresolved,
+        ];
+        console.warn(`Message ${msg._id}: ${unresolved.length} legacy reaction owner(s) were quarantined for manual review.`);
+      }
+    }
     await msg.save();
   }
 
-  console.log("Legacy ma’lumotlar migratsiyasi xatosiz yakunlandi.");
-  await mongoose.disconnect();
+  await ensureIndexes();
+  console.log("Legacy ma’lumotlar migratsiyasi yakunlandi. Eski avatarlar va reaksiyalar saqlangan holda tekshirildi.");
+  if (disconnect) await mongoose.disconnect();
 }
 
 if (require.main === module && process.argv.includes("--migrate")) {
@@ -133,6 +147,8 @@ if (require.main === module && process.argv.includes("--migrate")) {
   mongoose
     .connect(DB_URI)
     .then(async () => {
+      // Normalize old documents before unique indexes are created on startup.
+      await migrateLegacyData({ connect: false, disconnect: false });
       await User.updateMany(
         {},
         { $set: { isOnline: false, socketId: null, socketIds: [] } },
@@ -147,4 +163,4 @@ if (require.main === module && process.argv.includes("--migrate")) {
     });
 }
 
-module.exports = { privateRoomId, groupRoomId, hashToken };
+module.exports = { privateRoomId, groupRoomId, hashToken, migrateLegacyData };

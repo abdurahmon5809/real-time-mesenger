@@ -1,8 +1,8 @@
 import { useEffect, useRef } from "react";
 import { socket } from "../utils/socket";
+import { canJoinProtectedRoom } from "../utils/session-gate";
 
 export function useChatSocket({
-  authToken,
   activeChat,
   currentUserId,
   soundEnabled,
@@ -18,6 +18,7 @@ export function useChatSocket({
   onMessageDeleted,
   onMessagesRead,
   onChatDeleted,
+  onChatCleared,
   onDisplayTyping,
   onHideTyping
 }) {
@@ -25,6 +26,8 @@ export function useChatSocket({
   const currentUserIdRef = useRef(currentUserId);
   const soundEnabledRef = useRef(soundEnabled);
   const roomGenerationRef = useRef(0);
+  const sessionReadyRef = useRef(false);
+  const pendingJoinRef = useRef(null);
 
   useEffect(() => {
     activeChatRef.current = activeChat;
@@ -63,34 +66,49 @@ export function useChatSocket({
 
     const handleConnect = () => {
       onConnectedChange?.(true);
-      const chat = activeChatRef.current;
-      if (chat && (chat.id || chat.name)) {
-        roomGenerationRef.current += 1;
-        socket.emit("join_room", { target: chat.id || chat.name, isGroup: !!chat.isGroup });
-      }
+      // Socket.IO connect does not mean that the application session has been
+      // restored. Wait for session_restored before joining a protected room.
+      sessionReadyRef.current = false;
+      // A chat selected while reconnecting is newer than the last rendered
+      // activeChat prop; do not overwrite that pending selection here.
+      pendingJoinRef.current = pendingJoinRef.current || activeChatRef.current;
     };
 
     const handleDisconnect = () => {
+      sessionReadyRef.current = false;
       onConnectedChange?.(false);
     };
 
     const handleConnectError = (err) => {
+      sessionReadyRef.current = false;
       onConnectedChange?.(false);
       if (err && (err.message === "SESSION_INVALID" || err.message === "AUTH_CHECK_FAILED")) {
+        pendingJoinRef.current = null;
         onSessionExpired?.("Sessiya muddati tugagan yoki noto‘g‘ri. Qayta kiring.");
       }
     };
 
     const handleSessionRestored = (payload) => {
-      onSessionRestored?.(payload?.user);
-      const chat = activeChatRef.current;
-      if (chat && (chat.id || chat.name)) {
+      sessionReadyRef.current = true;
+      const chat = pendingJoinRef.current || activeChatRef.current;
+      pendingJoinRef.current = null;
+      if (canJoinProtectedRoom(socket.connected, sessionReadyRef.current) && chat && (chat.id || chat.name)) {
         roomGenerationRef.current += 1;
-        socket.emit("join_room", { target: chat.id || chat.name, isGroup: !!chat.isGroup });
+        const requestId = `${Date.now()}-${roomGenerationRef.current}`;
+        onSessionRestored?.(payload?.user, requestId);
+        socket.emit("join_room", {
+          target: chat.id || chat.name,
+          isGroup: !!chat.isGroup,
+          requestId,
+        });
+      } else {
+        onSessionRestored?.(payload?.user, null);
       }
     };
 
     const handleSessionExpired = (payload) => {
+      sessionReadyRef.current = false;
+      pendingJoinRef.current = null;
       onConnectedChange?.(false);
       onSessionExpired?.(payload?.message || "Sessiya yakunlandi. Qayta kiring.");
     };
@@ -100,10 +118,12 @@ export function useChatSocket({
     };
 
     const handleRoomJoined = (payload) => {
+      if (!sessionReadyRef.current) return;
       onRoomJoined?.(payload);
     };
 
     const handleLoadHistory = (payload) => {
+      if (!sessionReadyRef.current) return;
       const gen = roomGenerationRef.current;
       onLoadHistory?.(payload, gen);
     };
@@ -134,6 +154,10 @@ export function useChatSocket({
       onChatDeleted?.(payload);
     };
 
+    const handleChatCleared = (payload) => {
+      onChatCleared?.(payload);
+    };
+
     const handleDisplayTyping = (payload) => {
       onDisplayTyping?.(payload);
     };
@@ -155,6 +179,7 @@ export function useChatSocket({
     socket.on("message_deleted", handleMessageDeleted);
     socket.on("messages_read", handleMessagesRead);
     socket.on("chat_deleted", handleChatDeleted);
+    socket.on("chat_cleared", handleChatCleared);
     socket.on("display_typing", handleDisplayTyping);
     socket.on("hide_typing", handleHideTyping);
 
@@ -172,10 +197,11 @@ export function useChatSocket({
       socket.off("message_deleted", handleMessageDeleted);
       socket.off("messages_read", handleMessagesRead);
       socket.off("chat_deleted", handleChatDeleted);
+      socket.off("chat_cleared", handleChatCleared);
       socket.off("display_typing", handleDisplayTyping);
       socket.off("hide_typing", handleHideTyping);
     };
-  }, [authToken]);
+  }, []);
 
   const requestOlderMessages = ({ room, before, beforeId }, callback) => {
     const gen = roomGenerationRef.current;
@@ -190,9 +216,14 @@ export function useChatSocket({
     return roomGenerationRef.current;
   };
 
+  const isSessionReady = () => sessionReadyRef.current;
+  const setPendingJoin = (chat) => { pendingJoinRef.current = chat || null; };
+
   return {
     roomGenerationRef,
     bumpRoomGeneration,
-    requestOlderMessages
+    requestOlderMessages,
+    isSessionReady,
+    setPendingJoin
   };
 }

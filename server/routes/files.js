@@ -120,14 +120,26 @@ router.post(
         flag: "wx",
       });
 
-      if (user.avatar && user.avatar.startsWith("/uploads/avatars/")) {
-        const oldPath = path.join(AVATAR_DIR, path.basename(user.avatar));
-        if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+      const oldAvatar = user.avatar;
+      const avatarUrl = `/uploads/avatars/${storageName}`;
+      try {
+        user.avatar = avatarUrl;
+        await user.save();
+      } catch (saveError) {
+        try { fs.unlinkSync(path.join(AVATAR_DIR, storageName)); } catch {}
+        user.avatar = oldAvatar;
+        throw saveError;
       }
 
-      const avatarUrl = `/uploads/avatars/${storageName}`;
-      user.avatar = avatarUrl;
-      await user.save();
+      // Remove the previous file only after the new file and DB update succeeded.
+      if (oldAvatar && oldAvatar.startsWith("/uploads/avatars/")) {
+        const oldPath = path.join(AVATAR_DIR, path.basename(oldAvatar));
+        if (oldPath !== path.join(AVATAR_DIR, storageName) && fs.existsSync(oldPath)) {
+          try { fs.unlinkSync(oldPath); } catch (cleanupError) {
+            console.warn("Old avatar cleanup failed:", cleanupError.message);
+          }
+        }
+      }
 
       if (req.app.locals.sendDirectory) {
         await req.app.locals.sendDirectory();

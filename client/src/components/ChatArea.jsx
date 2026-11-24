@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from "react";
 import { API_URL, EMOJIS } from "../utils/constants";
 import { getAvatarColor, getInitials, resolveAvatar } from "../utils/media";
+import { shouldClearDraftAfterSend } from "../utils/draft-state";
+import { createClientMsgId } from "../utils/ids";
 
 function ChatAvatar({ name, avatar, size = 40, isOnline = false }) {
   const src = resolveAvatar(avatar);
@@ -45,6 +47,7 @@ export default function ChatArea({
   activeChat,
   currentUser,
   currentUserId,
+  sessionUserIdRef,
   messages,
   typingUsers,
   users,
@@ -70,6 +73,18 @@ export default function ChatArea({
   t = (k) => k,
 }) {
   const [text, setText] = useState("");
+  const draftsRef = useRef(new Map());
+  const textRef = useRef("");
+  const selectedFileRef = useRef(null);
+  const pendingSendIdsRef = useRef(new Map());
+  const fileIdentityRef = useRef(new WeakMap());
+  const nextFileIdentityRef = useRef(0);
+  const uploadedDraftFileRef = useRef(null);
+  const draftKeyRef = useRef(activeChat ? `${activeChat.isGroup ? "group" : "dm"}:${activeChat.id || activeChat.name}` : "");
+  const skipDraftWriteRef = useRef(false);
+  const activeDraftKey = activeChat ? `${activeChat.isGroup ? "group" : "dm"}:${activeChat.id || activeChat.name}` : "";
+  const activeDraftKeyRef = useRef(activeDraftKey);
+  activeDraftKeyRef.current = activeDraftKey;
   const [replyTo, setReplyTo] = useState(null);
   const [editingMsg, setEditingMsg] = useState(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
@@ -98,6 +113,12 @@ export default function ChatArea({
   }, [messages.length, activeChat?.name]);
 
   useEffect(() => {
+    if (draftKeyRef.current !== activeDraftKey) {
+      if (draftKeyRef.current) draftsRef.current.set(draftKeyRef.current, text);
+      draftKeyRef.current = activeDraftKey;
+      skipDraftWriteRef.current = true;
+      setText(draftsRef.current.get(activeDraftKey) || "");
+    }
     setReplyTo(null);
     setEditingMsg(null);
     setSelectedFile(null);
@@ -106,7 +127,31 @@ export default function ChatArea({
     setActiveReactionMsgId(null);
     setHeaderMenuOpen(false);
     if (onClearChatError) onClearChatError();
-  }, [activeChat?.id, activeChat?.name]);
+  }, [activeDraftKey]);
+
+  useEffect(() => {
+    textRef.current = text;
+    selectedFileRef.current = selectedFile;
+  }, [text, selectedFile]);
+
+  useEffect(() => {
+    if (skipDraftWriteRef.current) {
+      skipDraftWriteRef.current = false;
+      return;
+    }
+    if (activeDraftKey) draftsRef.current.set(activeDraftKey, text);
+  }, [text, activeDraftKey]);
+
+  useEffect(() => {
+    // Never carry one account's unsent drafts into another account.
+    draftsRef.current.clear();
+    textRef.current = "";
+    selectedFileRef.current = null;
+    pendingSendIdsRef.current.clear();
+    uploadedDraftFileRef.current = null;
+    setSelectedFile(null);
+    setText("");
+  }, [currentUserId]);
 
   const handleMessagesScroll = () => {
     const node = messagesListRef.current;
@@ -162,6 +207,8 @@ export default function ChatArea({
 
   const handleTextChange = (e) => {
     const val = e.target.value;
+    textRef.current = val;
+    if (activeDraftKey) draftsRef.current.set(activeDraftKey, val);
     setText(val);
     if (uploadError) setUploadError("");
     if (onClearChatError) onClearChatError();
@@ -182,6 +229,7 @@ export default function ChatArea({
       e.target.value = "";
       return;
     }
+    selectedFileRef.current = file;
     setSelectedFile(file);
     e.target.value = "";
   };
@@ -206,13 +254,33 @@ export default function ChatArea({
     return data;
   };
 
+  const getFileIdentity = (file) => {
+    if (!file) return "";
+    if (!fileIdentityRef.current.has(file)) {
+      nextFileIdentityRef.current += 1;
+      fileIdentityRef.current.set(file, nextFileIdentityRef.current);
+    }
+    return fileIdentityRef.current.get(file);
+  };
+
   const handleSend = async (e) => {
     e.preventDefault();
     if (uploadingFile) return;
 
-    const trimmed = text.trim();
-    if (!trimmed && !selectedFile) {
+    const submittedText = text;
+    const submittedFile = selectedFile;
+    const submittedChat = activeChat;
+    const submittedUserId = currentUserId;
+    const submittedUsername = currentUser;
+    const submittedChatKey = activeDraftKey;
+    const trimmed = submittedText.trim();
+    if (!trimmed && !submittedFile) {
       setUploadError(t("errEmptyMessage"));
+      return;
+    }
+
+    if (trimmed.length > 10000) {
+      setUploadError("Xabar 10 000 belgidan oshmasligi kerak.");
       return;
     }
 
@@ -224,27 +292,71 @@ export default function ChatArea({
         setUploadError(t("errEmptyEdit"));
         return;
       }
-      onEditMessage(editingMsg.id, trimmed);
+      const result = await onEditMessage(editingMsg.id, trimmed);
+      const latestUserId = sessionUserIdRef ? sessionUserIdRef.current : currentUserId;
+      const sameAccount = String(latestUserId || "") === String(submittedUserId || "");
+      if (result?.success && sameAccount && draftsRef.current.get(submittedChatKey) === submittedText) {
+        draftsRef.current.set(submittedChatKey, "");
+      }
+      if (!sameAccount || activeDraftKeyRef.current !== submittedChatKey) return;
+      if (!result?.success) {
+        if (!result?.silent) setUploadError(result?.message || "Xabar tahrirlanmadi. Matn saqlab qolindi.");
+        return;
+      }
       setEditingMsg(null);
+      textRef.current = "";
       setText("");
+      setUploadError("");
       return;
     }
 
-    let uploadedPayload = null;
-    if (selectedFile) {
-      setUploadingFile(true);
-      setUploadError("");
-      try {
-        uploadedPayload = await uploadFileToServer(selectedFile);
-      } catch (err) {
-        setUploadingFile(false);
-        setUploadError(err.message || t("errFileUpload"));
-        return;
-      }
-      setUploadingFile(false);
+    const fileIdentity = getFileIdentity(submittedFile);
+    const replyIdentity = replyTo?.id || replyTo?._id || `${replyTo?.sender || ""}:${replyTo?.text || ""}`;
+    const sendSignature = `${activeDraftKey}|${submittedText}|${fileIdentity}|${replyIdentity}`;
+    let clientMessageId = pendingSendIdsRef.current.get(sendSignature);
+    if (!clientMessageId) {
+      clientMessageId = createClientMsgId();
+      pendingSendIdsRef.current.set(sendSignature, clientMessageId);
     }
 
-    onSendMessage({
+    let uploadedPayload = null;
+    if (submittedFile) {
+      const cachedUpload = uploadedDraftFileRef.current;
+      if (cachedUpload?.file === submittedFile && cachedUpload.chatKey === activeDraftKey) {
+        uploadedPayload = cachedUpload.payload;
+      } else {
+        setUploadingFile(true);
+        setUploadError("");
+        try {
+          uploadedPayload = await uploadFileToServer(submittedFile);
+          uploadedDraftFileRef.current = {
+            file: submittedFile,
+            chatKey: activeDraftKey,
+            payload: uploadedPayload,
+          };
+        } catch (err) {
+          setUploadingFile(false);
+          const latestUserId = sessionUserIdRef ? sessionUserIdRef.current : currentUserId;
+          if (String(latestUserId || "") === String(submittedUserId || "") && activeDraftKeyRef.current === submittedChatKey) {
+            setUploadError(err.message || t("errFileUpload"));
+          }
+          return;
+        }
+        setUploadingFile(false);
+      }
+    }
+
+    const latestUserId = sessionUserIdRef ? sessionUserIdRef.current : currentUserId;
+    if (
+      String(latestUserId || "") !== String(submittedUserId || "") ||
+      activeDraftKeyRef.current !== submittedChatKey
+    ) return;
+
+    const sendResult = await onSendMessage({
+      clientMessageId,
+      chat: submittedChat,
+      senderId: submittedUserId,
+      sender: submittedUsername,
       text: trimmed,
       file: uploadedPayload ? uploadedPayload.file : null,
       fileName: uploadedPayload ? uploadedPayload.fileName : null,
@@ -257,10 +369,41 @@ export default function ChatArea({
         : null,
     });
 
-    setText("");
-    setReplyTo(null);
-    setSelectedFile(null);
-    setShowEmojiPicker(false);
+    if (!sendResult?.success) {
+      const latestUserId = sessionUserIdRef ? sessionUserIdRef.current : currentUserId;
+      if (
+        !sendResult?.silent &&
+        String(latestUserId || "") === String(submittedUserId || "") &&
+        activeDraftKeyRef.current === submittedChatKey
+      ) {
+        setUploadError(sendResult?.message || "Xabar yuborilmadi. Matn saqlab qolindi.");
+      }
+      return;
+    }
+
+    // A delayed acknowledgement must not erase text or a file the user added
+    // while this send was in flight.
+    if (sendResult?.success) {
+      pendingSendIdsRef.current.delete(sendSignature);
+      if (uploadedDraftFileRef.current?.file === submittedFile) uploadedDraftFileRef.current = null;
+      const latestUserId = sessionUserIdRef ? sessionUserIdRef.current : currentUserId;
+      if (String(latestUserId || "") === String(submittedUserId || "") && draftsRef.current.get(submittedChatKey) === submittedText) {
+        draftsRef.current.set(submittedChatKey, "");
+      }
+    }
+
+    const finalUserId = sessionUserIdRef ? sessionUserIdRef.current : currentUserId;
+    const stillSameDraft =
+      String(finalUserId || "") === String(submittedUserId || "") &&
+      activeDraftKeyRef.current === submittedChatKey;
+    if (stillSameDraft && shouldClearDraftAfterSend(sendResult, textRef.current, submittedText, selectedFileRef.current, submittedFile)) {
+      textRef.current = "";
+      selectedFileRef.current = null;
+      setText("");
+      setReplyTo(null);
+      setSelectedFile(null);
+      setShowEmojiPicker(false);
+    }
   };
 
   const startEdit = (msg) => {
@@ -273,6 +416,7 @@ export default function ChatArea({
   const cancelEditOrReply = () => {
     setEditingMsg(null);
     setReplyTo(null);
+    textRef.current = "";
     setText("");
     setUploadError("");
   };
@@ -567,10 +711,9 @@ export default function ChatArea({
                             ? usersList
                             : [];
                           if (!list.length) return null;
-                          const reactedByMe =
-                            (currentUserId &&
-                              list.includes(String(currentUserId))) ||
-                            list.includes(currentUser);
+                          const reactedByMe = Boolean(
+                            currentUserId && list.includes(String(currentUserId))
+                          );
                           return (
                             <button
                               key={emoji}
@@ -748,7 +891,12 @@ export default function ChatArea({
                   key={em}
                   type="button"
                   onClick={() => {
-                    setText((prev) => `${prev}${em}`);
+                    setText((prev) => {
+                      const next = `${prev}${em}`;
+                      textRef.current = next;
+                      if (activeDraftKey) draftsRef.current.set(activeDraftKey, next);
+                      return next;
+                    });
                     setShowEmojiPicker(false);
                   }}
                 >
@@ -768,6 +916,9 @@ export default function ChatArea({
           {uploadingFile ? "⏳" : editingMsg ? "✓" : "➤"}
         </button>
       </form>
+      <div className={`composer-char-count ${text.length > 10000 ? "over-limit" : ""}`}>
+        {text.length.toLocaleString()} / 10 000
+      </div>
     </div>
   );
 }

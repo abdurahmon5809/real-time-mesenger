@@ -8,7 +8,13 @@ import React, {
 import { socket } from "./utils/socket";
 import { DEFAULT_BIO } from "./utils/constants";
 import { createTranslator } from "./utils/i18n";
+import { isCurrentChatResponse } from "./utils/request-guard";
 import { useChatSocket } from "./hooks/useChatSocket";
+import { useSessionActions } from "./hooks/useSessionActions";
+import { useChatNavigation } from "./hooks/useChatNavigation";
+import { useMessageActions } from "./hooks/useMessageActions";
+import { useMediaViewer } from "./hooks/useMediaViewer";
+import { useSessionState } from "./hooks/useSessionState";
 import AuthScreen from "./components/AuthScreen";
 import Sidebar from "./components/Sidebar";
 import ChatArea from "./components/ChatArea";
@@ -21,23 +27,7 @@ import {
 } from "./components/Modals";
 import "./App.css";
 
-const createClientMsgId = () => {
-  if (
-    typeof crypto !== "undefined" &&
-    typeof crypto.randomUUID === "function"
-  ) {
-    return crypto.randomUUID();
-  }
-  return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-};
-
 export default function App() {
-  const [currentUser, setCurrentUser] = useState("");
-  const [currentUserId, setCurrentUserId] = useState("");
-  const [authToken, setAuthToken] = useState("");
-  const [myAvatar, setMyAvatar] = useState("");
-  const [myBio, setMyBio] = useState(DEFAULT_BIO);
-  const [authError, setAuthError] = useState("");
 
   const [users, setUsers] = useState([]);
   const [groups, setGroups] = useState([]);
@@ -56,7 +46,7 @@ export default function App() {
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [groupInfoTarget, setGroupInfoTarget] = useState(null);
-  const [mediaViewer, setMediaViewer] = useState(null);
+  const { mediaViewer, setMediaViewer, openMediaViewer, closeMediaViewer } = useMediaViewer();
 
   const [theme, setTheme] = useState(
     () => localStorage.getItem("chat_theme") || "light",
@@ -75,9 +65,8 @@ export default function App() {
 
   const activeChatRef = useRef(activeChat);
   const currentRoomIdRef = useRef(currentRoomId);
-  const currentUserRef = useRef(currentUser);
-  const currentUserIdRef = useRef(currentUserId);
   const tRef = useRef(t);
+  const joinRequestRef = useRef(0);
 
   useEffect(() => {
     activeChatRef.current = activeChat;
@@ -86,14 +75,6 @@ export default function App() {
   useEffect(() => {
     currentRoomIdRef.current = currentRoomId;
   }, [currentRoomId]);
-
-  useEffect(() => {
-    currentUserRef.current = currentUser;
-  }, [currentUser]);
-
-  useEffect(() => {
-    currentUserIdRef.current = currentUserId;
-  }, [currentUserId]);
 
   useEffect(() => {
     tRef.current = t;
@@ -125,12 +106,10 @@ export default function App() {
     return "";
   }, []);
 
-  const clearSessionState = useCallback((notice = "") => {
-    setCurrentUser("");
-    setCurrentUserId("");
-    setAuthToken("");
-    setMyAvatar("");
-    setMyBio(DEFAULT_BIO);
+  const clearAccountScopedState = useCallback(() => {
+    activeChatRef.current = null;
+    currentRoomIdRef.current = "";
+    joinRequestRef.current = null;
     setUsers([]);
     setGroups([]);
     setSummaries({});
@@ -145,40 +124,38 @@ export default function App() {
     setShowProfileModal(false);
     setShowSettingsModal(false);
     setGroupInfoTarget(null);
-    if (notice) setAuthError(notice);
+    setMediaViewer(null);
+    setIsConnected(false);
   }, []);
 
-  useEffect(() => {
-    const savedToken =
-      sessionStorage.getItem("chat_token") ||
-      localStorage.getItem("chat_token") ||
-      "";
-    const savedUsername =
-      sessionStorage.getItem("chat_user") ||
-      localStorage.getItem("chat_user") ||
-      "";
-    const savedUserId =
-      sessionStorage.getItem("chat_user_id") ||
-      localStorage.getItem("chat_user_id") ||
-      "";
-
-    if (savedToken) {
-      setAuthToken(savedToken);
-      if (savedUsername) setCurrentUser(savedUsername);
-      if (savedUserId) setCurrentUserId(savedUserId);
-      socket.auth = { token: savedToken };
-      if (!socket.connected) socket.connect();
-    }
-  }, []);
-
-  const { bumpRoomGeneration, requestOlderMessages } = useChatSocket({
+  const {
+    currentUser,
+    currentUserId,
     authToken,
+    myAvatar,
+    myBio,
+    authError,
+    currentUserRef,
+    currentUserIdRef,
+    setCurrentUser,
+    setCurrentUserId,
+    setAuthToken,
+    setMyAvatar,
+    setMyBio,
+    setAuthError,
+    clearSessionState,
+  } = useSessionState({ onClearAccountState: clearAccountScopedState });
+
+  const { bumpRoomGeneration, requestOlderMessages, isSessionReady, setPendingJoin } = useChatSocket({
     activeChat,
     currentUserId,
     soundEnabled,
     onConnectedChange: setIsConnected,
-    onSessionRestored: (userObj) => {
+    onSessionRestored: (userObj, requestId) => {
+      if (requestId) joinRequestRef.current = requestId;
       if (!userObj) return;
+      currentUserRef.current = userObj.username || "";
+      currentUserIdRef.current = userObj.id || userObj.userId || "";
       setCurrentUser(userObj.username || "");
       setCurrentUserId(userObj.id || userObj.userId || "");
       setMyAvatar(userObj.avatar || "");
@@ -190,6 +167,9 @@ export default function App() {
         sessionStorage.setItem("chat_user_id", userObj.id || userObj.userId);
     },
     onSessionExpired: (msg) => {
+      // Invalidate pending history/older-message callbacks before clearing state.
+      bumpRoomGeneration();
+      joinRequestRef.current = null;
       sessionStorage.removeItem("chat_token");
       sessionStorage.removeItem("chat_user");
       sessionStorage.removeItem("chat_user_id");
@@ -223,7 +203,9 @@ export default function App() {
       }
     },
     onRoomJoined: (payload) => {
-      if (!payload?.room) return;
+      const expectedRoom = computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+      if (!payload?.room || !isCurrentChatResponse(payload, joinRequestRef.current, expectedRoom)) return;
+      currentRoomIdRef.current = payload.room;
       setCurrentRoomId(payload.room);
       setActiveChat((prev) => {
         if (!prev) return prev;
@@ -256,11 +238,7 @@ export default function App() {
       const activeRoom =
         currentRoomIdRef.current ||
         computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
-      if (
-        !payload ||
-        (activeRoom && payload.room && payload.room !== activeRoom)
-      )
-        return;
+      if (!isCurrentChatResponse(payload, joinRequestRef.current, activeRoom)) return;
       const hist = Array.isArray(payload.history) ? payload.history : [];
       setMessages(hist);
       setHasMoreMessages(hist.length >= 50);
@@ -293,13 +271,6 @@ export default function App() {
           if (
             msg.clientMessageId &&
             item.clientMessageId === msg.clientMessageId
-          )
-            return false;
-          if (
-            item.text &&
-            msg.text &&
-            item.text === msg.text &&
-            item.sender === msg.sender
           )
             return false;
           return true;
@@ -358,21 +329,25 @@ export default function App() {
       if (payload.room && activeRoom && payload.room !== activeRoom) return;
 
       setMessages((prev) => {
-        let reachedTarget = !payload.upToMessageId;
-        return prev.map((m) => {
+        // A receipt is meaningful only if its exact boundary exists in this
+        // room's loaded history. Never mark messages beyond that boundary.
+        const boundaryIndex = payload.upToMessageId
+          ? prev.findIndex((message) =>
+              message.id === payload.upToMessageId ||
+              message._id === payload.upToMessageId,
+            )
+          : prev.length - 1;
+        if (boundaryIndex < 0) return prev;
+        return prev.map((message, index) => {
+          if (index > boundaryIndex) return message;
           const isMine =
             (currentUserIdRef.current &&
-              m.senderId &&
-              String(m.senderId) === String(currentUserIdRef.current)) ||
-            m.sender === currentUserRef.current;
-          if (isMine && !reachedTarget) {
-            if (m.id === payload.upToMessageId) reachedTarget = true;
-            return { ...m, isRead: true };
-          }
-          if (isMine && reachedTarget) {
-            return { ...m, isRead: true };
-          }
-          return m;
+              message.senderId &&
+              String(message.senderId) === String(currentUserIdRef.current)) ||
+            message.sender === currentUserRef.current;
+          return isMine && !message.isRead
+            ? { ...message, isRead: true }
+            : message;
         });
       });
     },
@@ -382,12 +357,28 @@ export default function App() {
         currentRoomIdRef.current ||
         computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
       if (deletedRoom && activeRoom === deletedRoom) {
+        bumpRoomGeneration();
+        joinRequestRef.current = null;
+        activeChatRef.current = null;
+        currentRoomIdRef.current = "";
         setActiveChat(null);
         setCurrentRoomId("");
         setMessages([]);
         setChatError(tRef.current("chatDeletedNotice"));
       }
       setGroupInfoTarget(null);
+    },
+    onChatCleared: (payload) => {
+      const activeRoom =
+        currentRoomIdRef.current ||
+        computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
+      if (payload?.room && payload.room === activeRoom) {
+        bumpRoomGeneration();
+        joinRequestRef.current = null;
+        setMessages([]);
+        setHasMoreMessages(false);
+        setIsLoadingOlder(false);
+      }
     },
     onDisplayTyping: ({ username, room }) => {
       if (!room || !username) return;
@@ -406,244 +397,88 @@ export default function App() {
     },
   });
 
-  const handleAuthSuccess = ({ username, userId, token, avatar, bio }) => {
-    setCurrentUser(username);
-    setCurrentUserId(userId);
-    setAuthToken(token);
-    setMyAvatar(avatar || "");
-    setMyBio(bio || DEFAULT_BIO);
-    setAuthError("");
-    setChatError("");
+  const { handleAuthSuccess, handleLogout, handleDeleteAccount } = useSessionActions({
+    socket,
+    currentUserRef,
+    currentUserIdRef,
+    setCurrentUser,
+    setCurrentUserId,
+    setAuthToken,
+    setMyAvatar,
+    setMyBio,
+    setAuthError,
+    setChatError,
+    bumpRoomGeneration,
+    setPendingJoin,
+    clearSessionState,
+    t,
+  });
 
-    sessionStorage.setItem("chat_token", token);
-    sessionStorage.setItem("chat_user", username);
-    if (userId) sessionStorage.setItem("chat_user_id", userId);
+  const { handleSelectChat, handleLoadOlder } = useChatNavigation({
+    socket,
+    activeChatRef,
+    currentRoomIdRef,
+    currentUserIdRef,
+    computeRoomIdForChat,
+    bumpRoomGeneration,
+    isSessionReady,
+    setPendingJoin,
+    setChatError,
+    setActiveChat,
+    setMessages,
+    setCurrentRoomId,
+    hasMoreMessages,
+    isLoadingOlder,
+    setHasMoreMessages,
+    setIsLoadingOlder,
+    joinRequestRef,
+    requestOlderMessages,
+    messages,
+    t,
+  });
 
-    bumpRoomGeneration();
-    socket.auth = { token };
-    if (socket.connected) {
-      socket.disconnect();
+  const {
+    handleSendMessage,
+    handleEditMessage,
+    handleDeleteMessage,
+    handleToggleReaction,
+    handleClearChat,
+  } = useMessageActions({
+    socket,
+    activeChatRef,
+    currentRoomIdRef,
+    currentUserIdRef,
+    currentUserRef,
+    computeRoomIdForChat,
+    isSessionReady,
+    setMessages,
+    setChatError,
+    t,
+  });
+
+  // useChatSocket registers all client listeners before this effect connects.
+  useEffect(() => {
+    const savedToken =
+      sessionStorage.getItem("chat_token") ||
+      localStorage.getItem("chat_token") ||
+      "";
+    const savedUsername =
+      sessionStorage.getItem("chat_user") ||
+      localStorage.getItem("chat_user") ||
+      "";
+    const savedUserId =
+      sessionStorage.getItem("chat_user_id") ||
+      localStorage.getItem("chat_user_id") ||
+      "";
+
+    if (savedToken) {
+      setAuthToken(savedToken);
+      if (savedUsername) setCurrentUser(savedUsername);
+      if (savedUserId) setCurrentUserId(savedUserId);
+      socket.auth = { token: savedToken };
+      if (!socket.connected) socket.connect();
     }
-    socket.connect();
-  };
-
-  const handleLogout = () => {
-    const finishLogout = () => {
-      sessionStorage.removeItem("chat_token");
-      sessionStorage.removeItem("chat_user");
-      sessionStorage.removeItem("chat_user_id");
-      localStorage.removeItem("chat_token");
-      localStorage.removeItem("chat_user");
-      localStorage.removeItem("chat_user_id");
-      bumpRoomGeneration();
-      clearSessionState();
-      if (socket.connected) {
-        socket.disconnect();
-      }
-    };
-
-    if (socket.connected) {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          finishLogout();
-        }
-      }, 1500);
-
-      socket.emit("logout", {}, () => {
-        clearTimeout(timer);
-        if (!settled) {
-          settled = true;
-          finishLogout();
-        }
-      });
-    } else {
-      finishLogout();
-    }
-  };
-
-  const handleSelectChat = (chat) => {
-    setChatError("");
-    const prevRoom = currentRoomIdRef.current;
-    if (prevRoom && socket.connected) {
-      socket.emit("leave_room", { room: prevRoom });
-    }
-
-    bumpRoomGeneration();
-    setActiveChat(chat);
-    setMessages([]);
-    setHasMoreMessages(false);
-    setIsLoadingOlder(false);
-
-    const predictedRoom = computeRoomIdForChat(chat, currentUserId);
-    setCurrentRoomId(predictedRoom);
-
-    if (socket.connected) {
-      socket.emit(
-        "join_room",
-        { target: chat.id || chat.name, isGroup: !!chat.isGroup },
-        (res) => {
-          if (res && !res.success) {
-            setChatError(res.message || t("joinFailedError"));
-          }
-        },
-      );
-    }
-  };
-
-  const handleLoadOlder = () => {
-    if (isLoadingOlder || !hasMoreMessages || messages.length === 0) return;
-    const oldest = messages[0];
-    const room =
-      currentRoomIdRef.current ||
-      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
-    if (!room) return;
-
-    setIsLoadingOlder(true);
-    requestOlderMessages(
-      {
-        room,
-        before: oldest.createdAt || null,
-        beforeId: oldest._id || null,
-      },
-      (res) => {
-        setIsLoadingOlder(false);
-        if (res?.success && Array.isArray(res.history)) {
-          setMessages((prev) => {
-            const existingIds = new Set(prev.map((m) => m.id || m._id));
-            const uniqueOlder = res.history.filter(
-              (m) => !existingIds.has(m.id || m._id),
-            );
-            return [...uniqueOlder, ...prev];
-          });
-          setHasMoreMessages(!!res.hasMore);
-        }
-      },
-    );
-  };
-
-  const handleSendMessage = ({ text, file, fileName, fileType, replyTo }) => {
-    const chat = activeChatRef.current;
-    if (!chat) return;
-    setChatError("");
-
-    const clientMessageId = createClientMsgId();
-    const room =
-      currentRoomIdRef.current ||
-      computeRoomIdForChat(chat, currentUserIdRef.current);
-    const nowTime = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-
-    const optimisticMsg = {
-      id: clientMessageId,
-      clientMessageId,
-      room,
-      senderId: currentUserIdRef.current,
-      sender: currentUserRef.current,
-      receiver: chat.name,
-      text: text || "",
-      file: file || null,
-      fileName: fileName || "",
-      fileType: fileType || "",
-      time: nowTime,
-      isRead: false,
-      isEdited: false,
-      replyTo: replyTo || null,
-      reactions: {},
-      pending: true,
-    };
-
-    setMessages((prev) => [...prev, optimisticMsg]);
-
-    if (!socket.connected) {
-      setChatError(t("disconnectedError"));
-      setMessages((prev) =>
-        prev.filter((m) => m.clientMessageId !== clientMessageId),
-      );
-      return;
-    }
-
-    socket.emit(
-      "send_message",
-      {
-        clientMessageId,
-        target: chat.id || chat.name,
-        groupId: chat.isGroup ? chat.id : undefined,
-        isGroup: !!chat.isGroup,
-        text: text || "",
-        file: file || null,
-        fileName: fileName || "",
-        fileType: fileType || "",
-        replyTo: replyTo || null,
-      },
-      (res) => {
-        if (!res?.success) {
-          setMessages((prev) =>
-            prev.filter((m) => m.clientMessageId !== clientMessageId),
-          );
-          setChatError(res?.message || t("sendFailedError"));
-          return;
-        }
-        if (res.message) {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.clientMessageId === clientMessageId
-                ? { ...res.message, pending: false }
-                : m,
-            ),
-          );
-        }
-      },
-    );
-  };
-
-  const handleEditMessage = (msgId, newText) => {
-    const room =
-      currentRoomIdRef.current ||
-      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
-    socket.emit("edit_message", { msgId, newText, room }, (res) => {
-      if (!res?.success) {
-        setChatError(res?.message || t("sendFailedError"));
-      }
-    });
-  };
-
-  const handleDeleteMessage = (msgId) => {
-    const room =
-      currentRoomIdRef.current ||
-      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
-    socket.emit("delete_message", { msgId, room }, (res) => {
-      if (!res?.success) {
-        setChatError(res?.message || t("sendFailedError"));
-      }
-    });
-  };
-
-  const handleToggleReaction = (msgId, emoji) => {
-    const room =
-      currentRoomIdRef.current ||
-      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
-    socket.emit("toggle_reaction", { msgId, emoji, room }, (res) => {
-      if (!res?.success) {
-        setChatError(res?.message || t("sendFailedError"));
-      }
-    });
-  };
-
-  const handleClearChat = () => {
-    const room =
-      currentRoomIdRef.current ||
-      computeRoomIdForChat(activeChatRef.current, currentUserIdRef.current);
-    if (!room) return;
-    socket.emit("clear_chat", { room }, (res) => {
-      if (!res?.success) {
-        setChatError(res?.message || t("sendFailedError"));
-      }
-    });
-  };
+  }, []);
 
   const handleCreateGroup = (groupName, members, cb) => {
     socket.emit("create_group", { groupName, members }, (res) => {
@@ -662,23 +497,6 @@ export default function App() {
         sessionStorage.setItem("chat_user", updatedName);
       }
       cb?.(res);
-    });
-  };
-
-  const handleDeleteAccount = (cb) => {
-    socket.emit("delete_account", {}, (res) => {
-      cb?.(res);
-      if (res?.success) {
-        sessionStorage.removeItem("chat_token");
-        sessionStorage.removeItem("chat_user");
-        sessionStorage.removeItem("chat_user_id");
-        localStorage.removeItem("chat_token");
-        localStorage.removeItem("chat_user");
-        localStorage.removeItem("chat_user_id");
-        bumpRoomGeneration();
-        clearSessionState(t("accountDeletedNotice"));
-        if (socket.connected) socket.disconnect();
-      }
     });
   };
 
@@ -751,6 +569,7 @@ export default function App() {
         activeChat={activeChat}
         currentUser={currentUser}
         currentUserId={currentUserId}
+        sessionUserIdRef={currentUserIdRef}
         messages={messages}
         typingUsers={currentTypingUsers}
         users={users}
@@ -767,12 +586,14 @@ export default function App() {
         onLoadOlder={handleLoadOlder}
         hasMoreMessages={hasMoreMessages}
         isLoadingOlder={isLoadingOlder}
-        onPreviewMedia={(url, name) => setMediaViewer({ url, fileName: name })}
+        onPreviewMedia={openMediaViewer}
         onBackToList={() => {
           const prevRoom = currentRoomIdRef.current;
           if (prevRoom && socket.connected)
             socket.emit("leave_room", { room: prevRoom });
           bumpRoomGeneration();
+          activeChatRef.current = null;
+          currentRoomIdRef.current = "";
           setActiveChat(null);
           setCurrentRoomId("");
           setMessages([]);
@@ -852,7 +673,7 @@ export default function App() {
         <MediaViewerModal
           mediaUrl={mediaViewer.url}
           fileName={mediaViewer.fileName}
-          onClose={() => setMediaViewer(null)}
+          onClose={closeMediaViewer}
           t={t}
         />
       )}

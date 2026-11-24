@@ -1397,3 +1397,13 @@ body,
     max-width: 88%;
   }
 }
+
+/* Composer character counter for the server-enforced 10,000 character limit. */
+.composer-char-count {
+  text-align: right;
+  padding: 2px 12px 6px;
+  font-size: 11px;
+  color: var(--text-secondary, #888);
+  pointer-events: none;
+}
+.composer-char-count.over-limit { color: #e05252; }

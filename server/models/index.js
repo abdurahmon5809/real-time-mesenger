@@ -19,7 +19,8 @@ const userSchema = new mongoose.Schema(
     socketId: { type: String, default: null },
     socketIds: { type: [String], default: [] },
     // Guruh bo'yicha oxirgi o'qilgan vaqt (groupId -> Date)
-    groupReadAt: { type: Map, of: Date, default: {} },
+    groupReadAt: { type: Map, of: Date, default: {} }, // legacy compatibility
+    groupReadCursor: { type: Map, of: mongoose.Schema.Types.Mixed, default: {} },
   },
   { timestamps: true },
 );
@@ -67,6 +68,7 @@ const messageSchema = new mongoose.Schema(
     isEdited: { type: Boolean, default: false },
     replyTo: mongoose.Schema.Types.Mixed,
     reactions: { type: Map, of: [String], default: {} },
+    legacyReactionsUnresolved: { type: [mongoose.Schema.Types.Mixed], default: [] },
   },
   { timestamps: true },
 );
@@ -74,7 +76,14 @@ messageSchema.index({ room: 1, createdAt: -1, _id: -1 });
 messageSchema.index({ room: 1, senderId: 1, createdAt: -1 });
 messageSchema.index(
   { senderId: 1, clientMessageId: 1 },
-  { unique: true, sparse: true },
+  {
+    unique: true,
+    partialFilterExpression: {
+      senderId: { $type: "objectId" },
+      clientMessageId: { $type: "string" },
+    },
+    name: "uniq_sender_client_message_id",
+  },
 );
 const Message = mongoose.model("Message", messageSchema);
 
